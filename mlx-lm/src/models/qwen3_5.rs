@@ -166,7 +166,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
         let d = args.hidden_size;
         let nh = args.num_attention_heads;
         let nkv = args.num_key_value_heads;
@@ -200,7 +200,7 @@ impl Attention {
     }
 
     #[allow(non_snake_case)]
-    fn forward(
+    pub fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
@@ -309,7 +309,7 @@ pub struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
         let hidden = args.hidden_size;
         let num_v_heads = args.linear_num_value_heads;
         let num_k_heads = args.linear_num_key_heads;
@@ -368,7 +368,7 @@ impl GatedDeltaNet {
     }
 
     #[allow(non_snake_case)]
-    fn forward(
+    pub fn forward(
         &mut self,
         inputs: &Array,
         conv_state: &mut Option<Array>,
@@ -565,7 +565,7 @@ pub struct Qwen3_5Model {
 }
 
 impl Qwen3_5Model {
-    fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(args.vocab_size, args.hidden_size)?;
         let layers = (0..args.num_hidden_layers)
             .map(|i| DecoderLayer::new(args, i))

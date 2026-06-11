@@ -148,7 +148,7 @@ pub struct SwitchGlu {
 }
 
 impl SwitchGlu {
-    fn new(group_size: i32, bits: i32) -> Self {
+    pub fn new(group_size: i32, bits: i32) -> Self {
         Self {
             gate_proj: QSwitchLinear::new(group_size, bits),
             up_proj: QSwitchLinear::new(group_size, bits),
@@ -157,7 +157,7 @@ impl SwitchGlu {
     }
 
     /// `x`: `[B, L, D]`, `indices`: `[B, L, k]` -> `[B, L, k, D]`.
-    fn forward(&self, x: &Array, indices: &Array) -> Result<Array, Exception> {
+    pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array, Exception> {
         let x = expand_dims_axes(x, &[-2, -3])?;
         let x_up = self.up_proj.forward(&x, indices)?;
         let x_gate = self.gate_proj.forward(&x, indices)?;
