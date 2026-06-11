@@ -33,11 +33,7 @@ use crate::{
         gated_delta::gated_delta_update,
         qwen3::{Mlp, QuantizationConfig},
     },
-    utils::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        scaled_dot_product_attention,
-    },
+    utils::rope::{initialize_rope, FloatOrString, RopeVariant},
 };
 
 /// Default prompt-prefill chunk size (tokens). Caps the full-attention
@@ -220,7 +216,7 @@ impl Attention {
     pub fn forward(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        causal: bool,
         cache: Option<&mut ConcatKeyValueCache>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
@@ -270,9 +266,12 @@ impl Attention {
             (keys, values)
         };
 
-        let attn = scaled_dot_product_attention::<&mut ConcatKeyValueCache>(
-            queries, keys, values, None, self.scale, mask,
-        )?;
+        // Fused causal SDPA: MLX's built-in causal mode skips the masked upper
+        // triangle and avoids an explicit `[L, ctx]` mask array (queries align to
+        // the last `L` of the cached keys). Decode (L==1) needs no mask.
+        let mask = causal.then_some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal);
+        let attn =
+            mlx_rs::fast::scaled_dot_product_attention(queries, keys, values, self.scale, mask, None)?;
         let out = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
         let gated = out.multiply(&nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
@@ -550,7 +549,7 @@ impl DecoderLayer {
     fn forward(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        causal: bool,
         cache: &mut LayerCache,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -559,7 +558,7 @@ impl DecoderLayer {
                 self.self_attn
                     .as_mut()
                     .unwrap()
-                    .forward(&normed, mask, Some(kv))?
+                    .forward(&normed, causal, Some(kv))?
             }
             (true, LayerCache::Linear { conv, state }) => self
                 .linear_attn
@@ -633,20 +632,10 @@ impl Qwen3_5Model {
     fn forward(&mut self, inputs: &Array, cache: &mut [LayerCache]) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
         let t = h.shape()[1];
-        // Full-attention causal mask (offset from any full-attn KV cache; all
-        // advance together). None on decode (T==1).
-        let offset = cache
-            .iter()
-            .find_map(|c| match c {
-                LayerCache::Full(kv) => Some(kv.offset()),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let mask = if t > 1 {
-            Some(create_causal_mask(t, Some(offset), None, None)?)
-        } else {
-            None
-        };
+        // Prefill (T>1) uses fused causal SDPA; decode (T==1) needs no mask. MLX's
+        // causal mode handles the KV-cache offset (queries align to the last T keys),
+        // so no explicit `[T, ctx]` mask array is built.
+        let causal = t > 1;
         let dbg = std::env::var("ROZUM_LAYER_DEBUG").is_ok();
         if dbg {
             let l2 = h
@@ -658,7 +647,7 @@ impl Qwen3_5Model {
             eprintln!("EMBED last_l2={l2:.4}");
         }
         for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
-            h = layer.forward(&h, mask.as_ref(), c)?;
+            h = layer.forward(&h, causal, c)?;
             if dbg && i < 6 {
                 let l2 = h
                     .index((0, -1, ..))

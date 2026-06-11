@@ -31,14 +31,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
+    cache::ConcatKeyValueCache,
     error::Error,
     models::{
         qwen3::{Mlp, QuantizationConfig},
         qwen3_5::{Attention, GatedDeltaNet, LayerCache, ModelArgs as Qwen35Args},
         qwen3_moe::SwitchGlu,
     },
-    utils::{create_causal_mask, rope::FloatOrString},
+    utils::rope::FloatOrString,
 };
 
 fn default_true() -> bool {
@@ -270,7 +270,7 @@ impl DecoderLayer {
     fn forward(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        causal: bool,
         cache: &mut LayerCache,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -279,7 +279,7 @@ impl DecoderLayer {
                 self.self_attn
                     .as_mut()
                     .unwrap()
-                    .forward(&normed, mask, Some(kv))?
+                    .forward(&normed, causal, Some(kv))?
             }
             (true, LayerCache::Linear { conv, state }) => self
                 .linear_attn
@@ -348,20 +348,10 @@ impl Qwen3_5MoeModel {
     fn forward(&mut self, inputs: &Array, cache: &mut [LayerCache]) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
         let t = h.shape()[1];
-        let offset = cache
-            .iter()
-            .find_map(|c| match c {
-                LayerCache::Full(kv) => Some(kv.offset()),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let mask = if t > 1 {
-            Some(create_causal_mask(t, Some(offset), None, None)?)
-        } else {
-            None
-        };
+        // Prefill uses fused causal SDPA; decode (T==1) needs no mask. See qwen3_5.
+        let causal = t > 1;
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(&h, mask.as_ref(), c)?;
+            h = layer.forward(&h, causal, c)?;
         }
         self.norm.forward(&h)
     }
