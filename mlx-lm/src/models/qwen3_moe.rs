@@ -522,6 +522,7 @@ pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
     sampler: crate::models::qwen3::SamplerOpts,
+    history: Vec<u32>,
     state: crate::models::qwen3::GenerateState<'a>,
 }
 
@@ -539,14 +540,16 @@ where
             model,
             cache,
             sampler: crate::models::qwen3::SamplerOpts::with_temp(temp),
+            history: Vec::new(),
             state: crate::models::qwen3::GenerateState::Prefill { prompt_token },
         }
     }
 
-    /// Set top-p / top-k filters (temp came from `new`).
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+    /// Set top-p / top-k / repeat-penalty (temp came from `new`).
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
+        self.sampler.repeat_penalty = repeat_penalty;
     }
 }
 
@@ -557,14 +560,24 @@ where
     type Item = Result<Array, Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use crate::models::qwen3::{sample_with, GenerateState};
-        use mlx_rs::ops::indexing::NewAxis;
+        use crate::models::qwen3::{repeat_window, sample_with, GenerateState};
+        use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 
         macro_rules! tri {
             ($e:expr) => {
                 match $e {
                     Ok(v) => v,
                     Err(e) => return Some(Err(e.into())),
+                }
+            };
+        }
+
+        macro_rules! record {
+            ($y:expr) => {
+                if self.sampler.repeat_penalty != 1.0 {
+                    tri!(mlx_rs::transforms::eval([&$y]));
+                    self.history
+                        .push(tri!($y.reshape(&[-1])).index(0).item::<u32>());
                 }
             };
         }
@@ -576,7 +589,17 @@ where
                     mask: None,
                     cache: self.cache,
                 }));
-                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler));
+                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+                    repeat_window(&self.history)
+                } else {
+                    &[]
+                };
+                let y = tri!(sample_with(
+                    &logits.index((.., -1, ..)),
+                    &self.sampler,
+                    recent
+                ));
+                record!(y);
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }
@@ -587,7 +610,13 @@ where
                     mask: None,
                     cache: self.cache,
                 }));
-                let y = tri!(sample_with(&logits, &self.sampler));
+                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+                    repeat_window(&self.history)
+                } else {
+                    &[]
+                };
+                let y = tri!(sample_with(&logits, &self.sampler, recent));
+                record!(y);
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }

@@ -939,6 +939,9 @@ pub struct Generate<'a> {
     model: &'a mut Model,
     cache: Vec<LayerCache>,
     sampler: crate::models::qwen3::SamplerOpts,
+    /// Generated-token history for the repetition penalty (only maintained when
+    /// `sampler.repeat_penalty != 1.0`).
+    history: Vec<u32>,
     state: GenState<'a>,
     /// Cooperative cancel: polled between prefill chunks so a client disconnect
     /// is honored mid-prefill (a long prompt can take seconds), not only between
@@ -958,6 +961,7 @@ impl<'a> Generate<'a> {
             model,
             cache,
             sampler: crate::models::qwen3::SamplerOpts::with_temp(temp),
+            history: Vec::new(),
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
         }
@@ -969,10 +973,12 @@ impl<'a> Generate<'a> {
         self.should_cancel = should_cancel;
     }
 
-    /// Set top-p / top-k filters (temp came from `new`). `top_k<=0`/`top_p>=1` off.
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+    /// Set top-p / top-k / repeat-penalty (temp came from `new`). `top_k<=0`,
+    /// `top_p>=1`, `repeat_penalty==1` disable the respective filter.
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
+        self.sampler.repeat_penalty = repeat_penalty;
     }
 }
 
@@ -1009,10 +1015,22 @@ impl Iterator for Generate<'_> {
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
+        let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+            crate::models::qwen3::repeat_window(&self.history)
+        } else {
+            &[]
+        };
         let y = tri!(crate::models::qwen3::sample_with(
             &logits.index((.., -1, ..)),
-            &self.sampler
+            &self.sampler,
+            recent,
         ));
+        // Maintain history only when the penalty is active (needs the token id ->
+        // an eval; the host re-uses the now-materialized token, so no double sync).
+        if self.sampler.repeat_penalty != 1.0 {
+            tri!(mlx_rs::transforms::eval([&y]));
+            self.history.push(y.index(0).item::<u32>());
+        }
         self.state = GenState::Decode(y.clone());
         Some(Ok(y))
     }

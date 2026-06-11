@@ -594,6 +594,8 @@ pub struct Generate<'a> {
     model: &'a mut Model,
     cache: Vec<LayerCache>,
     sampler: crate::models::qwen3::SamplerOpts,
+    /// Generated-token history for the repetition penalty (see qwen3_5).
+    history: Vec<u32>,
     state: GenState<'a>,
     /// Polled between prefill chunks for mid-prefill cancellation (see qwen3_5).
     should_cancel: Box<dyn Fn() -> bool + Send>,
@@ -611,6 +613,7 @@ impl<'a> Generate<'a> {
             model,
             cache,
             sampler: crate::models::qwen3::SamplerOpts::with_temp(temp),
+            history: Vec::new(),
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
         }
@@ -621,10 +624,11 @@ impl<'a> Generate<'a> {
         self.should_cancel = should_cancel;
     }
 
-    /// Set top-p / top-k filters (see qwen3_5).
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+    /// Set top-p / top-k / repeat-penalty (see qwen3_5).
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
+        self.sampler.repeat_penalty = repeat_penalty;
     }
 }
 
@@ -657,10 +661,20 @@ impl Iterator for Generate<'_> {
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
+        let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+            crate::models::qwen3::repeat_window(&self.history)
+        } else {
+            &[]
+        };
         let y = tri!(crate::models::qwen3::sample_with(
             &logits.index((.., -1, ..)),
-            &self.sampler
+            &self.sampler,
+            recent,
         ));
+        if self.sampler.repeat_penalty != 1.0 {
+            tri!(mlx_rs::transforms::eval([&y]));
+            self.history.push(y.index(0).item::<u32>());
+        }
         self.state = GenState::Decode(y.clone());
         Some(Ok(y))
     }

@@ -674,36 +674,72 @@ pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     Ok(model)
 }
 
-/// Sampling knobs. `top_k <= 0` and `top_p >= 1.0` disable those filters;
-/// `temp == 0.0` is greedy (argmax) regardless of the others.
+/// Sampling knobs. `top_k <= 0`, `top_p >= 1.0` and `repeat_penalty == 1.0`
+/// disable those filters; `temp == 0.0` is greedy (argmax) once the repetition
+/// penalty (if any) has been applied.
 #[derive(Debug, Clone, Copy)]
 pub struct SamplerOpts {
     pub temp: f32,
     pub top_p: f32,
     pub top_k: i32,
+    /// Repetition penalty (HF convention: divide positive logits / multiply
+    /// negative ones for recently-seen tokens). `1.0` = off.
+    pub repeat_penalty: f32,
 }
 
 impl SamplerOpts {
-    /// temp only (top_p/top_k off) — the historic `sample(logits, temp)` behavior.
+    /// temp only (top_p/top_k/repeat_penalty off) — the historic
+    /// `sample(logits, temp)` behavior.
     pub fn with_temp(temp: f32) -> Self {
         Self {
             temp,
             top_p: 1.0,
             top_k: 0,
+            repeat_penalty: 1.0,
         }
     }
 }
 
-/// Greedy@temp0 / temperature-categorical, preserved for existing callers.
+/// Greedy@temp0 / temperature-categorical, preserved for existing callers (no
+/// repetition penalty — pass `&[]` recent tokens).
 pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    sample_with(logits, &SamplerOpts::with_temp(temp))
+    sample_with(logits, &SamplerOpts::with_temp(temp), &[])
 }
 
-/// Sample one token id per row of `logits` (`[B, vocab]`). `temp == 0` is argmax
-/// (unchanged greedy path, kept byte-exact for the oracle tests); otherwise apply
-/// top-k then top-p (nucleus) filtering, then categorical. Ported from Python
-/// `mlx_lm` top_k / top_p sampling.
-pub fn sample_with(logits: &Array, opts: &SamplerOpts) -> Result<Array, Exception> {
+/// Down/up-weight the logits of `recent` token ids in place (HF repetition
+/// penalty): positive logits are divided by `penalty`, negative ones multiplied.
+/// `logits`: `[B, vocab]` with `B == 1`. Applied once per token regardless of
+/// repeat count (a duplicate index just re-writes the same penalized value).
+fn apply_repeat_penalty(logits: &Array, recent: &[u32], penalty: f32) -> Result<Array, Exception> {
+    let idx_vals: Vec<i32> = recent.iter().map(|&t| t as i32).collect();
+    let idx = Array::from_slice(&idx_vals, &[1, idx_vals.len() as i32]);
+    let selected = mlx_rs::ops::indexing::take_along_axis(logits, &idx, -1)?; // [1, N]
+    let pen = Array::from_f32(penalty);
+    let penalized = mlx_rs::ops::r#where(
+        &selected.gt(&Array::from_f32(0.0))?,
+        &selected.divide(&pen)?,
+        &selected.multiply(&pen)?,
+    )?;
+    mlx_rs::ops::indexing::put_along_axis(logits, &idx, &penalized, -1)
+}
+
+/// Sample one token id per row of `logits` (`[B, vocab]`). Applies the repetition
+/// penalty over `recent` (if any), then `temp == 0` is argmax (kept byte-exact for
+/// the oracle tests when no penalty), else top-k -> top-p (nucleus) -> categorical.
+/// Ported from Python `mlx_lm`.
+pub fn sample_with(
+    logits: &Array,
+    opts: &SamplerOpts,
+    recent: &[u32],
+) -> Result<Array, Exception> {
+    let penalized;
+    let logits = if opts.repeat_penalty != 1.0 && !recent.is_empty() {
+        penalized = apply_repeat_penalty(logits, recent, opts.repeat_penalty)?;
+        &penalized
+    } else {
+        logits
+    };
+
     if opts.temp == 0.0 {
         return argmax_axis!(logits, -1);
     }
@@ -744,10 +780,20 @@ fn top_p_sample(logits: &Array, top_p: f32) -> Result<Array, Exception> {
     Ok(gathered.index((.., 0)))
 }
 
+/// How many most-recent tokens the repetition penalty considers.
+pub const REPEAT_CONTEXT: usize = 256;
+
+/// The recent-token window of a generation history (the trailing
+/// [`REPEAT_CONTEXT`] ids), for the repetition penalty.
+pub fn repeat_window(history: &[u32]) -> &[u32] {
+    &history[history.len().saturating_sub(REPEAT_CONTEXT)..]
+}
+
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
     sampler: SamplerOpts,
+    history: Vec<u32>,
     state: GenerateState<'a>,
 }
 
@@ -765,14 +811,16 @@ where
             model,
             cache,
             sampler: SamplerOpts::with_temp(temp),
+            history: Vec::new(),
             state: GenerateState::Prefill { prompt_token },
         }
     }
 
-    /// Set top-p / top-k filters (temp came from `new`).
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+    /// Set top-p / top-k / repeat-penalty (temp came from `new`).
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
+        self.sampler.repeat_penalty = repeat_penalty;
     }
 }
 
@@ -805,7 +853,20 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler));
+                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+                    repeat_window(&self.history)
+                } else {
+                    &[]
+                };
+                let y = tri!(sample_with(
+                    &logits.index((.., -1, ..)),
+                    &self.sampler,
+                    recent
+                ));
+                if self.sampler.repeat_penalty != 1.0 {
+                    tri!(mlx_rs::transforms::eval([&y]));
+                    self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
+                }
                 self.state = GenerateState::Decode { y: y.clone() };
 
                 Some(Ok(y))
@@ -818,7 +879,16 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample_with(&logits, &self.sampler));
+                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+                    repeat_window(&self.history)
+                } else {
+                    &[]
+                };
+                let y = tri!(sample_with(&logits, &self.sampler, recent));
+                if self.sampler.repeat_penalty != 1.0 {
+                    tri!(mlx_rs::transforms::eval([&y]));
+                    self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
+                }
 
                 self.state = GenerateState::Decode { y: y.clone() };
 
@@ -861,7 +931,9 @@ mod tests {
                     temp,
                     top_p: 1.0,
                     top_k: 1,
+                    repeat_penalty: 1.0,
                 },
+                &[],
             )
             .unwrap();
             eval([&t]).unwrap();
@@ -875,16 +947,34 @@ mod tests {
                 temp: 1.0,
                 top_p: 1e-4,
                 top_k: 0,
+                repeat_penalty: 1.0,
             },
+            &[],
         )
         .unwrap();
         eval([&t]).unwrap();
         assert_eq!(t.index(0).item::<u32>(), want, "tiny top_p");
 
         // temp 0 stays argmax (greedy fast path).
-        let t = sample_with(&logits, &SamplerOpts::with_temp(0.0)).unwrap();
+        let t = sample_with(&logits, &SamplerOpts::with_temp(0.0), &[]).unwrap();
         eval([&t]).unwrap();
         assert_eq!(t.index(0).item::<u32>(), want, "greedy");
+
+        // Repetition penalty: greedy argmax is index 3 (logit 4.0). Penalizing 3
+        // hard (divide by 100) drops it below index 5 (logit 1.0) -> argmax moves.
+        let t = sample_with(
+            &logits,
+            &SamplerOpts {
+                temp: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                repeat_penalty: 100.0,
+            },
+            &[3],
+        )
+        .unwrap();
+        eval([&t]).unwrap();
+        assert_eq!(t.index(0).item::<u32>(), 5, "repeat_penalty pushes argmax off 3");
     }
 
     #[test]
