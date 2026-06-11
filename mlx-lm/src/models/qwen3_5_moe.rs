@@ -420,6 +420,36 @@ impl Model {
         }
     }
 
+    /// Chunked prompt prefill (returns last-position logits). See
+    /// [`super::qwen3_5::Model::prefill`] — same mechanism, MoE backbone.
+    pub fn prefill(
+        &mut self,
+        inputs: &Array,
+        cache: &mut [LayerCache],
+    ) -> Result<Array, Exception> {
+        let t = inputs.shape()[1];
+        let chunk = crate::models::qwen3_5::prefill_chunk_size();
+        if t <= chunk {
+            return Ok(self.forward(inputs, cache)?.index((.., (t - 1)..t, ..)));
+        }
+        let mut start = 0;
+        loop {
+            let end = (start + chunk).min(t);
+            let piece = inputs.index((.., start..end));
+            let logits = self.forward(&piece, cache)?;
+            if end == t {
+                let l = end - start;
+                return Ok(logits.index((.., (l - 1)..l, ..)));
+            }
+            let mut to_eval: Vec<&Array> = Vec::new();
+            for c in cache.iter() {
+                c.collect_eval(&mut to_eval);
+            }
+            mlx_rs::transforms::eval(to_eval)?;
+            start = end;
+        }
+    }
+
     pub fn init_cache(&self) -> Vec<LayerCache> {
         self.model.init_cache()
     }
@@ -567,11 +597,15 @@ impl Iterator for Generate<'_> {
                 }
             };
         }
-        let inputs = match &self.state {
-            GenState::Prefill(p) => (*p).clone(),
-            GenState::Decode(y) => y.index((.., NewAxis)),
+        let (inputs, is_prefill) = match &self.state {
+            GenState::Prefill(p) => ((*p).clone(), true),
+            GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
-        let logits = tri!(self.model.forward(&inputs, &mut self.cache));
+        let logits = if is_prefill {
+            tri!(self.model.prefill(&inputs, &mut self.cache))
+        } else {
+            tri!(self.model.forward(&inputs, &mut self.cache))
+        };
         let y = tri!(crate::models::qwen3::sample(
             &logits.index((.., -1, ..)),
             self.temp

@@ -40,6 +40,23 @@ use crate::{
     },
 };
 
+/// Default prompt-prefill chunk size (tokens). Caps the full-attention
+/// `[chunk, ctx]` causal-mask + score peak instead of `[T, T]` for a long prompt.
+const PREFILL_CHUNK_DEFAULT: i32 = 2048;
+/// Floor for a chunk size; tiny chunks only add per-chunk overhead.
+const PREFILL_CHUNK_MIN: i32 = 256;
+
+/// Prefill chunk size, env-tunable via `ROZUM_MLX_PREFILL_CHUNK` (floored to
+/// [`PREFILL_CHUNK_MIN`]). Shared by the dense and MoE Qwen3.6 prefill paths.
+pub fn prefill_chunk_size() -> i32 {
+    std::env::var("ROZUM_MLX_PREFILL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.max(PREFILL_CHUNK_MIN))
+        .unwrap_or(PREFILL_CHUNK_DEFAULT)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -471,6 +488,23 @@ pub enum LayerCache {
     },
 }
 
+impl LayerCache {
+    /// Push this layer's live cache arrays into `out`. Used to eval all caches
+    /// between prefill chunks: forcing them materializes the whole chunk forward
+    /// (each layer's cache depends on the previous layer's output), so the chunk's
+    /// activations are freed before the next chunk and the deferred graph does not
+    /// span the whole prompt.
+    pub fn collect_eval<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        match self {
+            LayerCache::Full(kv) => out.extend(kv.state_arrays()),
+            LayerCache::Linear { conv, state } => {
+                out.extend(conv.iter());
+                out.extend(state.iter());
+            }
+        }
+    }
+}
+
 // ─── Decoder layer / model ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -693,6 +727,57 @@ impl Model {
         }
     }
 
+    /// Prefill a (possibly long) prompt, returning logits for the LAST position
+    /// only (`[B, 1, vocab]`) — all `Generate` needs to sample the first token.
+    /// The prompt is processed in chunks of [`prefill_chunk_size`] so the
+    /// full-attention layers bound their `[chunk, ctx]` causal-mask + score peak
+    /// instead of `[T, T]`; the caches advance across chunks and are eval'd
+    /// between them to free each chunk's activations. The GatedDeltaNet layers
+    /// are already O(1) memory. The result is byte-identical to a single-pass
+    /// `forward` (the per-position attention and the sequential delta scan are
+    /// position-local; chunking only changes when intermediates are freed).
+    pub fn prefill(
+        &mut self,
+        inputs: &Array,
+        cache: &mut [LayerCache],
+    ) -> Result<Array, Exception> {
+        self.prefill_chunked(inputs, cache, prefill_chunk_size())
+    }
+
+    /// [`prefill`](Self::prefill) with an explicit chunk size (the env-driven
+    /// default goes through `prefill`). Exposed so tests can compare chunked vs
+    /// single-pass output.
+    pub fn prefill_chunked(
+        &mut self,
+        inputs: &Array,
+        cache: &mut [LayerCache],
+        chunk: i32,
+    ) -> Result<Array, Exception> {
+        let t = inputs.shape()[1];
+        if t <= chunk {
+            return Ok(self.forward(inputs, cache)?.index((.., (t - 1)..t, ..)));
+        }
+        let mut start = 0;
+        loop {
+            let end = (start + chunk).min(t);
+            let piece = inputs.index((.., start..end));
+            let logits = self.forward(&piece, cache)?;
+            if end == t {
+                let l = end - start;
+                return Ok(logits.index((.., (l - 1)..l, ..)));
+            }
+            // Force this chunk's caches (-> its whole forward), freeing the
+            // chunk's activations before the next chunk and keeping the deferred
+            // graph from spanning the prompt. Intermediate logits are discarded.
+            let mut to_eval: Vec<&Array> = Vec::new();
+            for c in cache.iter() {
+                c.collect_eval(&mut to_eval);
+            }
+            mlx_rs::transforms::eval(to_eval)?;
+            start = end;
+        }
+    }
+
     pub fn init_cache(&self) -> Vec<LayerCache> {
         self.model.init_cache()
     }
@@ -862,11 +947,17 @@ impl Iterator for Generate<'_> {
                 }
             };
         }
-        let inputs = match &self.state {
-            GenState::Prefill(p) => (*p).clone(),
-            GenState::Decode(y) => y.index((.., NewAxis)),
+        let (inputs, is_prefill) = match &self.state {
+            GenState::Prefill(p) => ((*p).clone(), true),
+            GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
-        let logits = tri!(self.model.forward(&inputs, &mut self.cache));
+        // Prefill chunks the prompt (bounded full-attention peak) and returns the
+        // last position only; decode (T=1) is a plain forward.
+        let logits = if is_prefill {
+            tri!(self.model.prefill(&inputs, &mut self.cache))
+        } else {
+            tri!(self.model.forward(&inputs, &mut self.cache))
+        };
         let y = tri!(crate::models::qwen3::sample(
             &logits.index((.., -1, ..)),
             self.temp

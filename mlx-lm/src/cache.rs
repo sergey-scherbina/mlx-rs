@@ -68,6 +68,12 @@ impl ConcatKeyValueCache {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The cache's live arrays, for forcing materialization (e.g. between
+    /// prefill chunks, so each chunk's activations are freed before the next).
+    pub fn state_arrays(&self) -> impl Iterator<Item = &Array> {
+        self.keys.iter().chain(self.values.iter())
+    }
 }
 
 impl KeyValueCache for ConcatKeyValueCache {
