@@ -9,14 +9,15 @@ use mlx_rs::{
     error::Exception,
     nn,
     ops::{expand_dims_axes, indexing::IndexOp, repeat_axis, stack_axis, zeros},
-    Array,
+    Array, Dtype,
 };
 
-/// `g = exp(-exp(A_log) * softplus(a + dt_bias))`, computed in f32.
-/// `a`: `[B, T, Hv]`, `A_log`/`dt_bias`: `[Hv]` -> `g`: `[B, T, Hv]`.
+/// `g = exp(-exp(A_log) * softplus(a + dt_bias))`, computed in f32 (matching
+/// Python's `A_log.astype(float32)`). `a`: `[B, T, Hv]`, `A_log`/`dt_bias`:
+/// `[Hv]` -> `g`: `[B, T, Hv]`.
 pub fn compute_g(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
     let inner = nn::softplus(&a.add(dt_bias)?)?;
-    let a_exp = a_log.exp()?;
+    let a_exp = a_log.as_dtype(Dtype::Float32)?.exp()?;
     a_exp.multiply(&inner)?.negative()?.exp()
 }
 
@@ -60,6 +61,15 @@ pub fn gated_delta_ops(
     let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
     let vs = v.shape();
     let (hv, dv) = (vs[2], vs[3]);
+    let out_dtype = q.dtype();
+
+    // The recurrence runs in f32 (matching Python's float state / Metal kernel);
+    // bf16 accumulation across positions drifts enough to break greedy parity.
+    let q = q.as_dtype(Dtype::Float32)?;
+    let k = k.as_dtype(Dtype::Float32)?;
+    let v = v.as_dtype(Dtype::Float32)?;
+    let g = g.as_dtype(Dtype::Float32)?;
+    let beta = beta.as_dtype(Dtype::Float32)?;
 
     let mut state = match state {
         Some(s) => s,
@@ -70,13 +80,30 @@ pub fn gated_delta_ops(
     let repeat_factor = hv / hk;
     let (q, k) = if repeat_factor > 1 {
         (
-            repeat_axis::<f32>(q.clone(), repeat_factor, -2)?,
-            repeat_axis::<f32>(k.clone(), repeat_factor, -2)?,
+            repeat_axis::<f32>(q, repeat_factor, -2)?,
+            repeat_axis::<f32>(k, repeat_factor, -2)?,
         )
     } else {
-        (q.clone(), k.clone())
+        (q, k)
     };
 
+    if std::env::var("ROZUM_GD_DEBUG").is_ok() {
+        let l2 = |x: &Array| {
+            x.index((0, -1))
+                .square()
+                .and_then(|s| s.sum(None))
+                .and_then(|s| s.sqrt())
+                .map(|s| s.item::<f32>())
+                .unwrap_or(f32::NAN)
+        };
+        eprintln!(
+            "GD g_l2={:.4} beta_l2={:.4} q_rep_l2={:.4} q_shape={:?}",
+            l2(&g),
+            l2(&beta),
+            l2(&q),
+            q.shape()
+        );
+    }
     let mut ys: Vec<Array> = Vec::with_capacity(t as usize);
     for ti in 0..t {
         let (y, ns) = delta_step(
@@ -90,8 +117,28 @@ pub fn gated_delta_ops(
         state = ns;
         ys.push(y);
     }
-    let y = stack_axis(&ys, 1)?; // [B,T,Hv,Dv]
+    let y = stack_axis(&ys, 1)?.as_dtype(out_dtype)?; // [B,T,Hv,Dv]
     Ok((y, state))
+}
+
+/// Full update used by the linear-attention layer: `beta = sigmoid(b)`,
+/// `g = compute_g(A_log, a, dt_bias)`, then the delta-rule scan.
+/// `q,k`: `[B,T,Hk,Dk]`, `v`: `[B,T,Hv,Dv]`, `a,b`: `[B,T,Hv]`,
+/// `A_log`/`dt_bias`: `[Hv]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_update(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    a: &Array,
+    b: &Array,
+    a_log: &Array,
+    dt_bias: &Array,
+    state: Option<Array>,
+) -> Result<(Array, Array), Exception> {
+    let beta = mlx_rs::nn::sigmoid(b)?;
+    let g = compute_g(a_log, a, dt_bias)?;
+    gated_delta_ops(q, k, v, &g, &beta, state)
 }
 
 #[cfg(test)]
