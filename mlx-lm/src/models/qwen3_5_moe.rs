@@ -443,9 +443,25 @@ impl Model {
         cache: &mut [LayerCache],
         chunk: i32,
     ) -> Result<Array, Exception> {
+        self.prefill_cancellable(inputs, cache, chunk, &|| false)
+            .map(|o| o.expect("prefill not cancelled"))
+    }
+
+    /// [`prefill_chunked`](Self::prefill_chunked) that polls `should_cancel`
+    /// between chunks; returns `Ok(None)` if it fired. See `qwen3_5`.
+    pub fn prefill_cancellable(
+        &mut self,
+        inputs: &Array,
+        cache: &mut [LayerCache],
+        chunk: i32,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Array>, Exception> {
         let t = inputs.shape()[1];
         let mut start = 0;
         let last_hidden = loop {
+            if should_cancel() {
+                return Ok(None);
+            }
             let end = (start + chunk).min(t);
             let piece = inputs.index((.., start..end));
             let hidden = self.model.forward(&piece, cache)?;
@@ -460,7 +476,7 @@ impl Model {
             mlx_rs::transforms::eval(to_eval)?;
             start = end;
         };
-        self.project(&last_hidden)
+        Ok(Some(self.project(&last_hidden)?))
     }
 
     pub fn init_cache(&self) -> Vec<LayerCache> {
@@ -579,6 +595,8 @@ pub struct Generate<'a> {
     cache: Vec<LayerCache>,
     temp: f32,
     state: GenState<'a>,
+    /// Polled between prefill chunks for mid-prefill cancellation (see qwen3_5).
+    should_cancel: Box<dyn Fn() -> bool + Send>,
 }
 
 enum GenState<'a> {
@@ -594,7 +612,13 @@ impl<'a> Generate<'a> {
             cache,
             temp,
             state: GenState::Prefill(prompt_token),
+            should_cancel: Box::new(|| false),
         }
+    }
+
+    /// Install a cancellation predicate, polled between prefill chunks.
+    pub fn set_cancel(&mut self, should_cancel: Box<dyn Fn() -> bool + Send>) {
+        self.should_cancel = should_cancel;
     }
 }
 
@@ -615,7 +639,15 @@ impl Iterator for Generate<'_> {
             GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
         let logits = if is_prefill {
-            tri!(self.model.prefill(&inputs, &mut self.cache))
+            match tri!(self.model.prefill_cancellable(
+                &inputs,
+                &mut self.cache,
+                crate::models::qwen3_5::prefill_chunk_size(),
+                &*self.should_cancel,
+            )) {
+                Some(l) => l,
+                None => return None,
+            }
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
