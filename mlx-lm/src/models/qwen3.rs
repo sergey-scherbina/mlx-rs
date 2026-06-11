@@ -9,7 +9,7 @@ use mlx_rs::{
     categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt},
+    module::{Module, ModuleParameters, ModuleParametersExt},
     nn,
     ops::indexing::{IndexOp, NewAxis},
     quantization::MaybeQuantized,
@@ -44,6 +44,13 @@ pub struct ModelArgs {
     pub head_dim: i32,
     pub tie_word_embeddings: bool,
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    pub quantization: Option<QuantizationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuantizationConfig {
+    pub group_size: i32,
+    pub bits: i32,
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -521,18 +528,59 @@ pub struct WeightMap {
 pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_qwen3_model_args(model_dir)?;
+    let quantization = model_args.quantization.clone();
     let mut model = Model::new(model_args)?;
 
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    let json = std::fs::read_to_string(weights_index)?;
-    let weight_map: WeightMap = serde_json::from_str(&json)?;
-
-    let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
-
-    for weight_file in weight_files {
-        let weights_filename = model_dir.join(weight_file);
-        model.load_safetensors(weights_filename)?;
+    // Pre-quantized mlx-community checkpoints ship AFQ weight/scales/biases; build
+    // the matching QuantizedLinear structure before loading so the keys line up.
+    if let Some(q) = quantization {
+        model = mlx_rs::nn::quantize(model, q.group_size, q.bits)?;
     }
+
+    // mlx-rs QuantizedLinear/QuantizedEmbedding nest the packed weight under
+    // `<prefix>.inner.weight`, but mlx-community checkpoints store it as
+    // `<prefix>.weight`. Remap `<prefix>.weight` -> `<prefix>.inner.weight`
+    // whenever a sibling `<prefix>.scales` is present (i.e. a quantized layer);
+    // leave norm and other `.weight` keys untouched. load_safetensors is
+    // non-strict (skips unmatched keys silently), so without this the packed
+    // weights stay at their random init and the model emits garbage.
+    fn load_weights_remapped(model: &mut Model, file: &Path) -> Result<usize, Error> {
+        let loaded = mlx_rs::Array::load_safetensors(file)?;
+        let has_scales: HashSet<String> = loaded
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+            .collect();
+        let mut params = model.parameters_mut().flatten();
+        let mut matched = 0usize;
+        for (key, value) in loaded {
+            let mapped = match key.strip_suffix(".weight") {
+                Some(prefix) if has_scales.contains(prefix) => format!("{prefix}.inner.weight"),
+                _ => key,
+            };
+            if let Some(param) = params.get_mut(mapped.as_str()) {
+                **param = value;
+                matched += 1;
+            }
+        }
+        Ok(matched)
+    }
+
+    let weights_index = model_dir.join("model.safetensors.index.json");
+    let mut matched = 0usize;
+    if weights_index.exists() {
+        let json = std::fs::read_to_string(weights_index)?;
+        let weight_map: WeightMap = serde_json::from_str(&json)?;
+        let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
+        for weight_file in weight_files {
+            matched += load_weights_remapped(&mut model, &model_dir.join(weight_file))?;
+        }
+    } else {
+        matched = load_weights_remapped(&mut model, &model_dir.join("model.safetensors"))?;
+    }
+    if std::env::var("ROZUM_MLX_DEBUG").is_ok() {
+        eprintln!("LOADED {matched} params");
+    }
+    model.eval()?;
 
     Ok(model)
 }
