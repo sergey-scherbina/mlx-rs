@@ -674,20 +674,80 @@ pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     Ok(model)
 }
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
+/// Sampling knobs. `top_k <= 0` and `top_p >= 1.0` disable those filters;
+/// `temp == 0.0` is greedy (argmax) regardless of the others.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerOpts {
+    pub temp: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+}
+
+impl SamplerOpts {
+    /// temp only (top_p/top_k off) — the historic `sample(logits, temp)` behavior.
+    pub fn with_temp(temp: f32) -> Self {
+        Self {
+            temp,
+            top_p: 1.0,
+            top_k: 0,
         }
     }
+}
+
+/// Greedy@temp0 / temperature-categorical, preserved for existing callers.
+pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
+    sample_with(logits, &SamplerOpts::with_temp(temp))
+}
+
+/// Sample one token id per row of `logits` (`[B, vocab]`). `temp == 0` is argmax
+/// (unchanged greedy path, kept byte-exact for the oracle tests); otherwise apply
+/// top-k then top-p (nucleus) filtering, then categorical. Ported from Python
+/// `mlx_lm` top_k / top_p sampling.
+pub fn sample_with(logits: &Array, opts: &SamplerOpts) -> Result<Array, Exception> {
+    if opts.temp == 0.0 {
+        return argmax_axis!(logits, -1);
+    }
+    let mut logits = logits.multiply(array!(1.0 / opts.temp))?;
+    let vocab = *logits.shape().last().expect("logits rank >= 1");
+
+    // top-k: keep only the k largest logits (mask the rest to -inf).
+    if opts.top_k > 0 && opts.top_k < vocab {
+        let sorted = mlx_rs::ops::sort_axis(&logits, -1)?; // ascending
+        let kth = sorted.index((.., vocab - opts.top_k)).index((.., NewAxis)); // [B,1]
+        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+        logits = mlx_rs::ops::r#where(&logits.lt(&kth)?, &neg_inf, &logits)?;
+    }
+
+    // top-p (nucleus): keep the smallest set of highest-prob tokens summing to p.
+    if opts.top_p < 1.0 {
+        return top_p_sample(&logits, opts.top_p);
+    }
+
+    categorical!(&logits)
+}
+
+/// Nucleus sampling: sample within the top-p mass, then map the sorted index back
+/// to the original vocab id. `logits`: `[B, vocab]` -> token ids `[B]`.
+fn top_p_sample(logits: &Array, top_p: f32) -> Result<Array, Exception> {
+    use mlx_rs::ops::indexing::take_along_axis;
+    let probs = mlx_rs::ops::softmax_axis(logits, -1, true)?;
+    let order = mlx_rs::ops::argsort_axis(&probs, -1)?; // ascending by prob
+    let sorted_probs = take_along_axis(&probs, &order, -1)?;
+    let cum = mlx_rs::ops::cumsum(&sorted_probs, -1, false, true)?; // inclusive
+    // Reading ascending, the nucleus is the high end whose cumulative crosses 1-p.
+    let keep = cum.gt(&Array::from_f32(1.0 - top_p))?;
+    let zero = Array::from_f32(0.0);
+    let kept = mlx_rs::ops::r#where(&keep, &sorted_probs, &zero)?;
+    let logp = kept.add(Array::from_f32(1e-9))?.log()?;
+    let sorted_tok = categorical!(&logp)?; // [B] index into the sorted axis
+    let gathered = take_along_axis(&order, &sorted_tok.index((.., NewAxis)), -1)?; // [B,1]
+    Ok(gathered.index((.., 0)))
 }
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
-    temp: f32,
+    sampler: SamplerOpts,
     state: GenerateState<'a>,
 }
 
@@ -704,9 +764,15 @@ where
         Self {
             model,
             cache,
-            temp,
+            sampler: SamplerOpts::with_temp(temp),
             state: GenerateState::Prefill { prompt_token },
         }
+    }
+
+    /// Set top-p / top-k filters (temp came from `new`).
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+        self.sampler.top_p = top_p;
+        self.sampler.top_k = top_k;
     }
 }
 
@@ -739,7 +805,7 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler));
                 self.state = GenerateState::Decode { y: y.clone() };
 
                 Some(Ok(y))
@@ -752,7 +818,7 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits, self.temp));
+                let y = tri!(sample_with(&logits, &self.sampler));
 
                 self.state = GenerateState::Decode { y: y.clone() };
 
@@ -776,6 +842,50 @@ mod tests {
     };
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
+
+    // Deterministic anchors for the top-k / top-p sampler: both collapse to argmax
+    // when only the top token can be selected, regardless of temp. Pins the
+    // filtering math without relying on RNG.
+    #[test]
+    fn sample_with_collapses_to_argmax() {
+        use super::{sample_with, SamplerOpts};
+        // A clear argmax at index 3.
+        let logits = Array::from_slice(&[0.1f32, 0.5, -1.0, 4.0, 0.2, 1.0], &[1, 6]);
+        let want = 3u32;
+
+        // top_k = 1 -> only the max survives -> categorical must return it.
+        for temp in [0.7f32, 1.0, 2.0] {
+            let t = sample_with(
+                &logits,
+                &SamplerOpts {
+                    temp,
+                    top_p: 1.0,
+                    top_k: 1,
+                },
+            )
+            .unwrap();
+            eval([&t]).unwrap();
+            assert_eq!(t.index(0).item::<u32>(), want, "top_k=1 temp={temp}");
+        }
+
+        // Tiny top_p -> nucleus is just the top token -> argmax.
+        let t = sample_with(
+            &logits,
+            &SamplerOpts {
+                temp: 1.0,
+                top_p: 1e-4,
+                top_k: 0,
+            },
+        )
+        .unwrap();
+        eval([&t]).unwrap();
+        assert_eq!(t.index(0).item::<u32>(), want, "tiny top_p");
+
+        // temp 0 stays argmax (greedy fast path).
+        let t = sample_with(&logits, &SamplerOpts::with_temp(0.0)).unwrap();
+        eval([&t]).unwrap();
+        assert_eq!(t.index(0).item::<u32>(), want, "greedy");
+    }
 
     #[test]
     #[ignore = "requires local model files"]

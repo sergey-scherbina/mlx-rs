@@ -521,7 +521,7 @@ pub fn load_qwen3_moe_model(model_dir: impl AsRef<Path>) -> Result<Model, Error>
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
-    temp: f32,
+    sampler: crate::models::qwen3::SamplerOpts,
     state: crate::models::qwen3::GenerateState<'a>,
 }
 
@@ -538,9 +538,15 @@ where
         Self {
             model,
             cache,
-            temp,
+            sampler: crate::models::qwen3::SamplerOpts::with_temp(temp),
             state: crate::models::qwen3::GenerateState::Prefill { prompt_token },
         }
+    }
+
+    /// Set top-p / top-k filters (temp came from `new`).
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+        self.sampler.top_p = top_p;
+        self.sampler.top_k = top_k;
     }
 }
 
@@ -551,7 +557,7 @@ where
     type Item = Result<Array, Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use crate::models::qwen3::{sample, GenerateState};
+        use crate::models::qwen3::{sample_with, GenerateState};
         use mlx_rs::ops::indexing::NewAxis;
 
         macro_rules! tri {
@@ -570,7 +576,7 @@ where
                     mask: None,
                     cache: self.cache,
                 }));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler));
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }
@@ -581,7 +587,7 @@ where
                     mask: None,
                     cache: self.cache,
                 }));
-                let y = tri!(sample(&logits, self.temp));
+                let y = tri!(sample_with(&logits, &self.sampler));
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }

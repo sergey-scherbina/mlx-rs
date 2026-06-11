@@ -938,7 +938,7 @@ pub fn load_qwen3_5_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 pub struct Generate<'a> {
     model: &'a mut Model,
     cache: Vec<LayerCache>,
-    temp: f32,
+    sampler: crate::models::qwen3::SamplerOpts,
     state: GenState<'a>,
     /// Cooperative cancel: polled between prefill chunks so a client disconnect
     /// is honored mid-prefill (a long prompt can take seconds), not only between
@@ -957,7 +957,7 @@ impl<'a> Generate<'a> {
         Self {
             model,
             cache,
-            temp,
+            sampler: crate::models::qwen3::SamplerOpts::with_temp(temp),
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
         }
@@ -967,6 +967,12 @@ impl<'a> Generate<'a> {
     /// returns true mid-prefill the iterator ends (`next() -> None`).
     pub fn set_cancel(&mut self, should_cancel: Box<dyn Fn() -> bool + Send>) {
         self.should_cancel = should_cancel;
+    }
+
+    /// Set top-p / top-k filters (temp came from `new`). `top_k<=0`/`top_p>=1` off.
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32) {
+        self.sampler.top_p = top_p;
+        self.sampler.top_k = top_k;
     }
 }
 
@@ -1003,9 +1009,9 @@ impl Iterator for Generate<'_> {
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
-        let y = tri!(crate::models::qwen3::sample(
+        let y = tri!(crate::models::qwen3::sample_with(
             &logits.index((.., -1, ..)),
-            self.temp
+            &self.sampler
         ));
         self.state = GenState::Decode(y.clone());
         Some(Ok(y))
