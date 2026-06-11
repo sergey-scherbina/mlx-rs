@@ -231,7 +231,10 @@ where
 {
     // pub conversations: &'a [Conversation<R, T>],
     pub conversations: I,
-    // pub tools: Option<Box<dyn FnOnce()>>, // TODO
+    /// Tool schemas (a JSON array of `{type, function:{name, description,
+    /// parameters}}`) exposed to the template as the `tools` variable. `None`
+    /// renders a tool-less prompt.
+    pub tools: Option<serde_json::Value>,
     pub documents: Option<&'a [Document]>,
     pub model_id: &'a str,
     pub chat_template_id: Option<&'a str>,
@@ -439,7 +442,7 @@ where
 {
     let ApplyChatTemplateArgs {
         conversations,
-        // tools,
+        tools,
         documents,
         model_id,
         chat_template_id,
@@ -462,13 +465,12 @@ where
         },
     };
 
-    // TODO: handle tool
-
     // TODO: allow return_generation_indices
 
     render_jinja_tempalte(
         template,
         conversations,
+        tools,
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
@@ -479,6 +481,7 @@ where
 fn render_jinja_tempalte<'a, R, T>(
     template: Template,
     conversations: impl IntoIterator<Item = Chat<'a, R, T>>,
+    tools: Option<serde_json::Value>,
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
@@ -495,6 +498,7 @@ where
     for chat in conversations {
         let mut rendered_chat = template.render(context! {
             messages => chat,
+            tools => tools,
             documents => documents,
             add_generation_prompt => add_generation_prompt,
         })?;
