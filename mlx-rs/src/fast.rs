@@ -257,6 +257,179 @@ pub fn layer_norm_device<'a>(
     })
 }
 
+// ─── Custom Metal kernels (`mx.fast.metal_kernel`) ───────────────────────────
+
+use crate::error::Exception;
+use crate::utils::VectorArray;
+use std::ffi::CString;
+
+/// A template argument for a JIT custom Metal kernel.
+#[derive(Debug, Clone)]
+pub enum TemplateArg<'a> {
+    /// A `dtype`-typed template parameter (`name`, value).
+    Dtype(&'a str, crate::Dtype),
+    /// An `int` template parameter (`name`, value).
+    Int(&'a str, i32),
+    /// A `bool` template parameter (`name`, value).
+    Bool(&'a str, bool),
+}
+
+/// A JIT-compiled custom Metal kernel (`mx.fast.metal_kernel`). Build once with
+/// [`MetalKernel::new`], then [`apply`](MetalKernel::apply) per call.
+pub struct MetalKernel {
+    inner: mlx_sys::mlx_fast_metal_kernel,
+}
+
+impl std::fmt::Debug for MetalKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetalKernel")
+    }
+}
+
+// The compiled kernel is immutable; MLX guards its own state internally.
+unsafe impl Send for MetalKernel {}
+unsafe impl Sync for MetalKernel {}
+
+fn c_vector_string(items: &[&str]) -> Result<mlx_sys::mlx_vector_string> {
+    let cstrs = items
+        .iter()
+        .map(|s| CString::new(*s).map_err(|_| Exception::custom("metal_kernel: NUL in name")))
+        .collect::<Result<Vec<_>>>()?;
+    let ptrs: Vec<*const std::os::raw::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+    Ok(unsafe {
+        mlx_sys::mlx_vector_string_new_data(
+            ptrs.as_ptr() as *mut *const std::os::raw::c_char,
+            ptrs.len(),
+        )
+    })
+}
+
+impl MetalKernel {
+    /// `source` is the kernel body; MLX injects the signature from
+    /// `input_names`/`output_names`. Inputs are made row-contiguous; outputs are
+    /// non-atomic.
+    pub fn new(
+        name: &str,
+        input_names: &[&str],
+        output_names: &[&str],
+        source: &str,
+    ) -> Result<Self> {
+        let name_c =
+            CString::new(name).map_err(|_| Exception::custom("metal_kernel: NUL in name"))?;
+        let source_c =
+            CString::new(source).map_err(|_| Exception::custom("metal_kernel: NUL in source"))?;
+        let header_c = CString::new("").unwrap();
+        let inputs = c_vector_string(input_names)?;
+        let outputs = c_vector_string(output_names)?;
+        let inner = unsafe {
+            mlx_sys::mlx_fast_metal_kernel_new(
+                name_c.as_ptr(),
+                inputs,
+                outputs,
+                source_c.as_ptr(),
+                header_c.as_ptr(),
+                true,
+                false,
+            )
+        };
+        unsafe {
+            mlx_sys::mlx_vector_string_free(inputs);
+            mlx_sys::mlx_vector_string_free(outputs);
+        }
+        Ok(Self { inner })
+    }
+
+    /// Run the kernel. `inputs` order must match `input_names`; one
+    /// `output_shapes`/`output_dtypes` entry per `output_names`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply(
+        &self,
+        inputs: &[impl AsRef<Array>],
+        template: &[TemplateArg],
+        grid: (i32, i32, i32),
+        threadgroup: (i32, i32, i32),
+        output_shapes: &[&[i32]],
+        output_dtypes: &[crate::Dtype],
+        stream: impl AsRef<Stream>,
+    ) -> Result<Vec<Array>> {
+        let cfg = unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() };
+        let build = || -> Result<()> {
+            unsafe {
+                for (shape, dt) in output_shapes.iter().zip(output_dtypes) {
+                    mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                        cfg,
+                        shape.as_ptr(),
+                        shape.len(),
+                        (*dt).into(),
+                    );
+                }
+                mlx_sys::mlx_fast_metal_kernel_config_set_grid(cfg, grid.0, grid.1, grid.2);
+                mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
+                    cfg,
+                    threadgroup.0,
+                    threadgroup.1,
+                    threadgroup.2,
+                );
+                for t in template {
+                    match t {
+                        TemplateArg::Dtype(n, d) => {
+                            let nc = CString::new(*n)
+                                .map_err(|_| Exception::custom("metal_kernel: NUL in template"))?;
+                            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+                                cfg,
+                                nc.as_ptr(),
+                                (*d).into(),
+                            );
+                        }
+                        TemplateArg::Int(n, v) => {
+                            let nc = CString::new(*n)
+                                .map_err(|_| Exception::custom("metal_kernel: NUL in template"))?;
+                            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                                cfg,
+                                nc.as_ptr(),
+                                *v,
+                            );
+                        }
+                        TemplateArg::Bool(n, v) => {
+                            let nc = CString::new(*n)
+                                .map_err(|_| Exception::custom("metal_kernel: NUL in template"))?;
+                            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
+                                cfg,
+                                nc.as_ptr(),
+                                *v,
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+        let run = || -> Result<Vec<Array>> {
+            build()?;
+            let in_vec = VectorArray::try_from_iter(inputs.iter())?;
+            let out: VectorArray = VectorArray::try_from_op(|res| unsafe {
+                mlx_sys::mlx_fast_metal_kernel_apply(
+                    res,
+                    self.inner,
+                    in_vec.as_ptr(),
+                    cfg,
+                    stream.as_ref().as_ptr(),
+                )
+            })?;
+            out.try_into_values::<Vec<Array>>()
+        };
+        let result = run();
+        unsafe { mlx_sys::mlx_fast_metal_kernel_config_free(cfg) };
+        result
+    }
+}
+
+impl Drop for MetalKernel {
+    fn drop(&mut self) {
+        unsafe { mlx_sys::mlx_fast_metal_kernel_free(self.inner) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +586,30 @@ mod tests {
 
         let result = scaled_dot_product_attention(&q, &k, &v, scale, None, &sinks).unwrap();
         assert_eq!(result.shape(), &[b, n_q, t_q, d]);
+    }
+
+    #[test]
+    fn metal_kernel_elementwise_add() {
+        use crate::transforms::eval;
+        let source = "
+            uint i = thread_position_in_grid.x;
+            out[i] = inp[i] + static_cast<float>(ADD);
+        ";
+        let kernel = MetalKernel::new("add_const", &["inp"], &["out"], source).unwrap();
+        let inp = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let outs = kernel
+            .apply(
+                &[&inp],
+                &[TemplateArg::Int("ADD", 10)],
+                (4, 1, 1),
+                (4, 1, 1),
+                &[&[4][..]],
+                &[crate::Dtype::Float32],
+                crate::StreamOrDevice::default(),
+            )
+            .unwrap();
+        let out = &outs[0];
+        eval([out]).unwrap();
+        assert_eq!(out.as_slice::<f32>(), &[11.0, 12.0, 13.0, 14.0]);
     }
 }

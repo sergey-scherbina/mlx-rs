@@ -1,9 +1,12 @@
-//! GatedDeltaNet recurrence (ops path) for Qwen3-Next / Qwen3.6 linear-attention
-//! layers. This is the pure-ops reference from Python `mlx_lm.models.gated_delta`
-//! (`gated_delta_ops`): a sequential per-token delta-rule scan. mlx-rs has no
-//! custom-kernel support, so the fast Metal kernel is not portable yet; the ops
-//! path is numerically identical and correct (fast for decode T=1, O(T) for
-//! prefill). Single-stream (batch 1, no padding) so the SSM mask is always None.
+//! GatedDeltaNet recurrence for Qwen3-Next / Qwen3.6 linear-attention layers,
+//! ported from Python `mlx_lm.models.gated_delta`. Two paths:
+//!   - [`gated_delta_kernel`] — the fast custom Metal kernel (`mx.fast.metal_kernel`):
+//!     the whole `T`-step scan in one GPU dispatch. The default (~3x faster
+//!     prefill). Requires `Dk % 32 == 0`.
+//!   - [`gated_delta_ops`] — the pure-ops reference (sequential per-token scan).
+//!     Numerically identical; the validated oracle and the `ROZUM_GD_OPS=1`
+//!     escape hatch.
+//! Single-stream (batch 1, no padding) so the SSM mask is always None.
 
 use mlx_rs::{
     error::Exception,
@@ -121,8 +124,136 @@ pub fn gated_delta_ops(
     Ok((y, state))
 }
 
+/// The fast Metal kernel (`mx.fast.metal_kernel`), scalar gating, no mask —
+/// ported verbatim from Python `mlx_lm.models.gated_delta`. One GPU dispatch
+/// does the whole `T`-step scan (vs the O(T) ops path). Requires `Dk % 32 == 0`.
+const GATED_DELTA_SOURCE: &str = r#"
+    auto n = thread_position_in_grid.z;
+    auto b_idx = n / Hv;
+    auto hv_idx = n % Hv;
+    auto hk_idx = hv_idx / (Hv / Hk);
+    constexpr int n_per_t = Dk / 32;
+
+    auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+    auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+    auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+    auto dk_idx = thread_position_in_threadgroup.x;
+    auto dv_idx = thread_position_in_grid.y;
+
+    auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+    float state[n_per_t];
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      state[i] = static_cast<float>(i_state[s_idx]);
+    }
+
+    auto g_ = g + b_idx * T * Hv;
+    auto beta_ = beta + b_idx * T * Hv;
+
+    for (int t = 0; t < T; ++t) {
+      float kv_mem = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        state[i] = state[i] * static_cast<float>(g_[hv_idx]);
+        kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+      }
+      kv_mem = simd_sum(kv_mem);
+
+      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+      float out = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+        out += state[i] * static_cast<float>(q_[s_idx]);
+      }
+      out = simd_sum(out);
+      if (thread_index_in_simdgroup == 0) {
+        y[dv_idx] = static_cast<InT>(out);
+      }
+
+      q_ += Hk * Dk;
+      k_ += Hk * Dk;
+      v_ += Hv * Dv;
+      y += Hv * Dv;
+      g_ += Hv;
+      beta_ += Hv;
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      o_state[s_idx] = static_cast<StT>(state[i]);
+    }
+"#;
+
+fn gated_delta_metal_kernel() -> &'static mlx_rs::fast::MetalKernel {
+    static KERNEL: std::sync::OnceLock<mlx_rs::fast::MetalKernel> = std::sync::OnceLock::new();
+    KERNEL.get_or_init(|| {
+        mlx_rs::fast::MetalKernel::new(
+            "gated_delta_step",
+            &["q", "k", "v", "g", "beta", "state_in", "T"],
+            &["y", "state_out"],
+            GATED_DELTA_SOURCE,
+        )
+        .expect("build gated_delta kernel")
+    })
+}
+
+/// Metal-kernel delta-rule scan (the fast path). `q,k`: `[B,T,Hk,Dk]` (NOT
+/// head-repeated — the kernel maps Hk->Hv internally), `v`: `[B,T,Hv,Dv]`,
+/// `g`/`beta`: `[B,T,Hv]`, `state`: `[B,Hv,Dv,Dk]` (zeros if None) ->
+/// (`y`: `[B,T,Hv,Dv]`, new `state`).
+pub fn gated_delta_kernel(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<Array>,
+) -> Result<(Array, Array), Exception> {
+    let qs = q.shape();
+    let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
+    let vs = v.shape();
+    let (hv, dv) = (vs[2], vs[3]);
+    let state = match state {
+        Some(s) => s,
+        None => zeros::<f32>(&[b, hv, dv, dk])?,
+    };
+    let t_scalar = Array::from_int(t);
+    let template = [
+        mlx_rs::fast::TemplateArg::Dtype("InT", q.dtype()),
+        mlx_rs::fast::TemplateArg::Dtype("StT", state.dtype()),
+        mlx_rs::fast::TemplateArg::Int("Dk", dk),
+        mlx_rs::fast::TemplateArg::Int("Dv", dv),
+        mlx_rs::fast::TemplateArg::Int("Hk", hk),
+        mlx_rs::fast::TemplateArg::Int("Hv", hv),
+    ];
+    let y_shape = [b, t, hv, dv];
+    let st_shape = [b, hv, dv, dk];
+    let outs = gated_delta_metal_kernel().apply(
+        &[q, k, v, g, beta, &state, &t_scalar],
+        &template,
+        (32, dv, b * hv),
+        (32, 4, 1),
+        &[&y_shape[..], &st_shape[..]],
+        &[q.dtype(), state.dtype()],
+        mlx_rs::StreamOrDevice::default(),
+    )?;
+    // Force materialization. The custom-kernel primitive misbehaves when many
+    // calls accumulate unevaluated in one graph (garbage output); evaluating each
+    // call's outputs fixes it and is free on throughput (it even avoids piling up
+    // lazy nodes). The whole T-step scan is still one GPU dispatch.
+    mlx_rs::transforms::eval([&outs[0], &outs[1]])?;
+    Ok((outs[0].clone(), outs[1].clone()))
+}
+
 /// Full update used by the linear-attention layer: `beta = sigmoid(b)`,
-/// `g = compute_g(A_log, a, dt_bias)`, then the delta-rule scan.
+/// `g = compute_g(A_log, a, dt_bias)`, then the delta-rule scan. Uses the fast
+/// Metal kernel by default; `ROZUM_GD_OPS=1` forces the ops reference path.
 /// `q,k`: `[B,T,Hk,Dk]`, `v`: `[B,T,Hv,Dv]`, `a,b`: `[B,T,Hv]`,
 /// `A_log`/`dt_bias`: `[Hv]`.
 #[allow(clippy::too_many_arguments)]
@@ -138,7 +269,11 @@ pub fn gated_delta_update(
 ) -> Result<(Array, Array), Exception> {
     let beta = mlx_rs::nn::sigmoid(b)?;
     let g = compute_g(a_log, a, dt_bias)?;
-    gated_delta_ops(q, k, v, &g, &beta, state)
+    if std::env::var("ROZUM_GD_OPS").is_ok() {
+        gated_delta_ops(q, k, v, &g, &beta, state)
+    } else {
+        gated_delta_kernel(q, k, v, &g, &beta, state)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +328,66 @@ mod tests {
         let got = y.as_slice::<f32>();
         for (i, (a, b)) in got.iter().zip(expected_y.iter()).enumerate() {
             assert!((a - b).abs() < 1e-3, "y[{i}] = {a} != {b} (python ref)");
+        }
+    }
+
+    // The fast Metal kernel must match the ops reference (Dk must be %32; uses
+    // Dk=Dv=32, Hk=1, Hv=2, T=4). Deterministic synthetic inputs.
+    #[test]
+    fn gated_delta_kernel_matches_ops() {
+        // Real Qwen3.6 linear dims (Hk=16, Hv=48, rf=3) to exercise hk mapping.
+        let (b, t, hk, hv, dk, dv) = (1, 4, 16, 48, 128, 128);
+        let gen = |n: usize, scale: f32, off: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.137 + off).sin() * scale)
+                .collect()
+        };
+        let q = Array::from_slice(&gen((t * hk * dk) as usize, 0.5, 0.0), &[b, t, hk, dk]);
+        let k = Array::from_slice(&gen((t * hk * dk) as usize, 0.5, 1.0), &[b, t, hk, dk]);
+        let v = Array::from_slice(&gen((t * hv * dv) as usize, 1.0, 2.0), &[b, t, hv, dv]);
+        // g in (0,1), beta in (0,1)
+        let gpos = |n: usize, off: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| 0.5 + 0.49 * ((i as f32) * 0.7 + off).sin())
+                .collect()
+        };
+        let g = Array::from_slice(&gpos((t * hv) as usize, 0.0), &[b, t, hv]);
+        let beta = Array::from_slice(&gpos((t * hv) as usize, 3.0), &[b, t, hv]);
+
+        // Mimic the model dtypes: q/k/v/beta bf16, g/state f32.
+        let bf = mlx_rs::Dtype::Bfloat16;
+        let q = q.as_dtype(bf).unwrap();
+        let k = k.as_dtype(bf).unwrap();
+        let v = v.as_dtype(bf).unwrap();
+        let beta = beta.as_dtype(bf).unwrap();
+
+        let (y_ops, st_ops) = gated_delta_ops(&q, &k, &v, &g, &beta, None).unwrap();
+        let (y_ker, st_ker) = gated_delta_kernel(&q, &k, &v, &g, &beta, None).unwrap();
+        // The recurrent state (reused at decode) must match too.
+        {
+            let so = st_ops.reshape(&[-1]).unwrap();
+            let sk = st_ker.reshape(&[-1]).unwrap();
+            eval([&so, &sk]).unwrap();
+            let (a, bb) = (so.as_slice::<f32>(), sk.as_slice::<f32>());
+            assert_eq!(a.len(), bb.len(), "state length mismatch");
+            for (i, (x, y)) in a.iter().zip(bb.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() < 5e-2,
+                    "kernel/ops STATE mismatch at {i}: ops={x} kernel={y}"
+                );
+            }
+        }
+        let f32 = mlx_rs::Dtype::Float32;
+        let yo = y_ops.reshape(&[-1]).unwrap().as_dtype(f32).unwrap();
+        let yk = y_ker.reshape(&[-1]).unwrap().as_dtype(f32).unwrap();
+        eval([&yo, &yk]).unwrap();
+        let (a, bb) = (yo.as_slice::<f32>(), yk.as_slice::<f32>());
+        assert_eq!(a.len(), bb.len());
+        for (i, (x, y)) in a.iter().zip(bb.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 5e-2,
+                "kernel/ops mismatch at {i}: ops={x} kernel={y}"
+            );
         }
     }
 }
