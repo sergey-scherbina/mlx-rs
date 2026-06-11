@@ -188,6 +188,25 @@ where
             keys = self.rope.forward(nn::RopeInput::new(&keys))?;
         }
 
+        if std::env::var("ROZUM_ATTN_DEBUG").is_ok() {
+            let l2 = |a: Array| -> f32 {
+                a.square()
+                    .and_then(|s| s.sum(None))
+                    .and_then(|s| s.sqrt())
+                    .map(|s| s.item::<f32>())
+                    .unwrap_or(f32::NAN)
+            };
+            eprintln!(
+                "ATTN kshape={:?} q_last_l2={:.4} k_pos0_l2={:.4} k_last_l2={:.4} v_pos0_l2={:.4} v_last_l2={:.4}",
+                keys.shape(),
+                l2(queries.index((0, 0, -1, ..))),
+                l2(keys.index((0, 0, 0, ..))),
+                l2(keys.index((0, 0, -1, ..))),
+                l2(values.index((0, 0, 0, ..))),
+                l2(values.index((0, 0, -1, ..))),
+            );
+        }
+
         let output = crate::utils::scaled_dot_product_attention(
             queries, keys, values, cache, self.scale, mask,
         )?
@@ -421,13 +440,24 @@ where
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
-        for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
+        let layer_debug = std::env::var("ROZUM_LAYER_DEBUG").is_ok();
+        for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
             let layer_input = AttentionInput {
                 x: &h,
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
             };
             h = layer.forward(layer_input)?;
+            if layer_debug {
+                let last = h.index((0, -1, ..));
+                let l2 = last
+                    .square()
+                    .and_then(|s| s.sum(None))
+                    .and_then(|s| s.sqrt())
+                    .map(|s| s.item::<f32>())
+                    .unwrap_or(f32::NAN);
+                eprintln!("LAYER {i} last_l2={l2:.4}");
+            }
         }
 
         self.norm.forward(&h)
