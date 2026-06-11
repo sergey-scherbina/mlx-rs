@@ -158,6 +158,23 @@ where
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
 
+        if std::env::var("ROZUM_QPROJ_DEBUG").is_ok() {
+            let h0 = queries
+                .index((0, -1, 0..5))
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .ok()
+                .map(|a| a.as_slice::<f32>().to_vec());
+            let h31 = queries
+                .index((0, -1, (31 * 128)..(31 * 128 + 5)))
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .ok()
+                .map(|a| a.as_slice::<f32>().to_vec());
+            eprintln!(
+                "QPROJ xshape={:?} h0_cols={h0:?} h31_cols={h31:?}",
+                x.shape()
+            );
+        }
+
         let mut queries = self.q_norm.forward(
             &queries
                 .reshape(&[B, L, self.n_heads, -1])?
@@ -171,6 +188,15 @@ where
         let mut values = values
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
+
+        if std::env::var("ROZUM_QPROJ_DEBUG").is_ok() {
+            let h31 = queries
+                .index((0, 31, -1, 0..5))
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .ok()
+                .map(|a| a.as_slice::<f32>().to_vec());
+            eprintln!("QNORM(pre-rope) qshape={:?} h31={h31:?}", queries.shape());
+        }
 
         if let Some(cache) = cache.as_mut() {
             let q_input = nn::RopeInputBuilder::new(&queries)
@@ -211,12 +237,16 @@ where
                 }
                 None => "mask=None".to_string(),
             };
+            let vals = queries
+                .index((0, 31, -1, 0..5))
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .ok()
+                .map(|a| a.as_slice::<f32>().to_vec());
             eprintln!(
-                "ATTN kshape={:?} q_last={:.4} k_all={:.4} v_all={:.4} {mask_info}",
-                keys.shape(),
-                l2(queries.index((0, 0, -1, ..))),
-                l2(keys.index((0, 0, .., ..))),
-                l2(values.index((0, 0, .., ..))),
+                "ATTN qshape={:?} q_h31={:.4} q_h31_vals={:?} {mask_info}",
+                queries.shape(),
+                l2(queries.index((0, 31, -1, ..))),
+                vals,
             );
         }
 

@@ -119,9 +119,12 @@ where
 
     fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
         let RopeInput { x, offset } = input.into();
-        let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
-        let x = crate::fast::rope(
+        // rozum: apply rope on the input shape directly. The reshape to 3D
+        // [-1, L, head_dim] tripped an MLX fast-rope bug for the single-position
+        // (L=1, decode) case where only the first batch row was rotated and later
+        // heads were left un-rotated, corrupting decode. (matches Python mlx_lm,
+        // which calls mx.fast.rope on the 4D [B, n_heads, L, head_dim] tensor).
+        crate::fast::rope(
             x,
             self.dimensions,
             self.traditional,
@@ -129,8 +132,7 @@ where
             self.scale,
             offset,
             None,
-        )?;
-        x.reshape(shape)
+        )
     }
 
     fn training_mode(&mut self, _mode: bool) {}

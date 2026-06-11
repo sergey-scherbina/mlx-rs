@@ -152,8 +152,20 @@ pub fn scaled_dot_product_attention_device<'a>(
     #[optional] sinks: impl Into<Option<&'a Array>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    // rozum: for "no mask" pass a null-ctx mlx_array, not mlx_array_new() (an
+    // empty but non-null array). mlx-c keys off `mask_arr.ctx`: a non-null empty
+    // array is treated as a real (degenerate) mask, which the single-query GQA
+    // SDPA kernel mishandles (decode garbage). A null ctx -> nullopt -> true
+    // no-mask, matching Python's mx.fast.scaled_dot_product_attention(mask=None).
     let (mask_mode, mask_arr) = mask.into_option().map_or_else(
-        || (DEFAULT_MASK_MODE, unsafe { mlx_sys::mlx_array_new() }),
+        || {
+            (
+                DEFAULT_MASK_MODE,
+                mlx_sys::mlx_array {
+                    ctx: std::ptr::null_mut(),
+                },
+            )
+        },
         |m| m.as_mode_and_mask(),
     );
 
@@ -169,7 +181,9 @@ pub fn scaled_dot_product_attention_device<'a>(
             sinks
                 .into()
                 .map(|a| a.as_ptr())
-                .unwrap_or(mlx_sys::mlx_array_new()),
+                .unwrap_or(mlx_sys::mlx_array {
+                    ctx: std::ptr::null_mut(),
+                }),
             stream.as_ref().as_ptr(),
         )
     })

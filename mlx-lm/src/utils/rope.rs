@@ -145,9 +145,11 @@ where
 
     fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
         let nn::RopeInput { x, offset } = input.into();
-        let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
-        let x = mlx_rs::fast::rope(
+        // rozum: apply rope on the 4D [B, n_heads, L, head_dim] directly. The old
+        // reshape to 3D [B*n_heads, L, head_dim] tripped an MLX fast-rope bug for
+        // the single-position (decode, L=1) case where only the first batch row
+        // got rotated (later heads were left un-rotated -> garbage decode).
+        mlx_rs::fast::rope(
             x,
             self.dimensions,
             self.traditional,
@@ -155,8 +157,7 @@ where
             self.scale,
             offset,
             &self.freqs,
-        )?;
-        x.reshape(shape)
+        )
     }
 
     fn training_mode(&mut self, _mode: bool) {}
