@@ -718,11 +718,16 @@ impl Model {
         cache: &mut [LayerCache],
     ) -> Result<Array, Exception> {
         let out = self.model.forward(inputs, cache)?;
+        self.project(&out)
+    }
+
+    /// Project hidden states to vocab logits (`lm_head`, or the tied embedding).
+    fn project(&mut self, hidden: &Array) -> Result<Array, Exception> {
         match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&out),
+            Some(lm_head) => lm_head.forward(hidden),
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&out),
-                MaybeQuantized::Quantized(q) => q.as_linear(&out),
+                MaybeQuantized::Original(e) => e.as_linear(hidden),
+                MaybeQuantized::Quantized(q) => q.as_linear(hidden),
             },
         }
     }
@@ -733,9 +738,12 @@ impl Model {
     /// full-attention layers bound their `[chunk, ctx]` causal-mask + score peak
     /// instead of `[T, T]`; the caches advance across chunks and are eval'd
     /// between them to free each chunk's activations. The GatedDeltaNet layers
-    /// are already O(1) memory. The result is byte-identical to a single-pass
-    /// `forward` (the per-position attention and the sequential delta scan are
-    /// position-local; chunking only changes when intermediates are freed).
+    /// are already O(1) memory. `lm_head` is applied only to the final position
+    /// (the per-chunk hidden states feed only the caches), so the big vocab
+    /// projection never runs on discarded positions. The result is byte-identical
+    /// to a single-pass `forward` of the last position (per-position attention +
+    /// sequential delta scan are position-local; chunking only changes when
+    /// intermediates are freed).
     pub fn prefill(
         &mut self,
         inputs: &Array,
@@ -754,28 +762,28 @@ impl Model {
         chunk: i32,
     ) -> Result<Array, Exception> {
         let t = inputs.shape()[1];
-        if t <= chunk {
-            return Ok(self.forward(inputs, cache)?.index((.., (t - 1)..t, ..)));
-        }
         let mut start = 0;
-        loop {
+        // Run the backbone (no lm_head) per chunk; keep only the final position's
+        // hidden state, then project that one position.
+        let last_hidden = loop {
             let end = (start + chunk).min(t);
             let piece = inputs.index((.., start..end));
-            let logits = self.forward(&piece, cache)?;
+            let hidden = self.model.forward(&piece, cache)?;
             if end == t {
                 let l = end - start;
-                return Ok(logits.index((.., (l - 1)..l, ..)));
+                break hidden.index((.., (l - 1)..l, ..));
             }
             // Force this chunk's caches (-> its whole forward), freeing the
             // chunk's activations before the next chunk and keeping the deferred
-            // graph from spanning the prompt. Intermediate logits are discarded.
+            // graph from spanning the prompt.
             let mut to_eval: Vec<&Array> = Vec::new();
             for c in cache.iter() {
                 c.collect_eval(&mut to_eval);
             }
             mlx_rs::transforms::eval(to_eval)?;
             start = end;
-        }
+        };
+        self.project(&last_hidden)
     }
 
     pub fn init_cache(&self) -> Vec<LayerCache> {

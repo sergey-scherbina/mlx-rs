@@ -411,35 +411,47 @@ impl Model {
         cache: &mut [LayerCache],
     ) -> Result<Array, Exception> {
         let out = self.model.forward(inputs, cache)?;
+        self.project(&out)
+    }
+
+    /// Project hidden states to vocab logits (`lm_head`, or the tied embedding).
+    fn project(&mut self, hidden: &Array) -> Result<Array, Exception> {
         match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&out),
+            Some(lm_head) => lm_head.forward(hidden),
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&out),
-                MaybeQuantized::Quantized(q) => q.as_linear(&out),
+                MaybeQuantized::Original(e) => e.as_linear(hidden),
+                MaybeQuantized::Quantized(q) => q.as_linear(hidden),
             },
         }
     }
 
     /// Chunked prompt prefill (returns last-position logits). See
-    /// [`super::qwen3_5::Model::prefill`] — same mechanism, MoE backbone.
+    /// [`super::qwen3_5::Model::prefill`] — same mechanism, MoE backbone;
+    /// `lm_head` runs only on the final position.
     pub fn prefill(
         &mut self,
         inputs: &Array,
         cache: &mut [LayerCache],
     ) -> Result<Array, Exception> {
+        self.prefill_chunked(inputs, cache, crate::models::qwen3_5::prefill_chunk_size())
+    }
+
+    /// [`prefill`](Self::prefill) with an explicit chunk size (for tests).
+    pub fn prefill_chunked(
+        &mut self,
+        inputs: &Array,
+        cache: &mut [LayerCache],
+        chunk: i32,
+    ) -> Result<Array, Exception> {
         let t = inputs.shape()[1];
-        let chunk = crate::models::qwen3_5::prefill_chunk_size();
-        if t <= chunk {
-            return Ok(self.forward(inputs, cache)?.index((.., (t - 1)..t, ..)));
-        }
         let mut start = 0;
-        loop {
+        let last_hidden = loop {
             let end = (start + chunk).min(t);
             let piece = inputs.index((.., start..end));
-            let logits = self.forward(&piece, cache)?;
+            let hidden = self.model.forward(&piece, cache)?;
             if end == t {
                 let l = end - start;
-                return Ok(logits.index((.., (l - 1)..l, ..)));
+                break hidden.index((.., (l - 1)..l, ..));
             }
             let mut to_eval: Vec<&Array> = Vec::new();
             for c in cache.iter() {
@@ -447,7 +459,8 @@ impl Model {
             }
             mlx_rs::transforms::eval(to_eval)?;
             start = end;
-        }
+        };
+        self.project(&last_hidden)
     }
 
     pub fn init_cache(&self) -> Vec<LayerCache> {
