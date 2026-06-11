@@ -196,22 +196,49 @@ where
                     .map(|s| s.item::<f32>())
                     .unwrap_or(f32::NAN)
             };
+            let mask_info = match mask {
+                Some(m) => {
+                    let lastrow = m.index((-1, ..));
+                    let sum = lastrow
+                        .sum(None)
+                        .map(|s| s.item::<f32>())
+                        .unwrap_or(f32::NAN);
+                    let minv = lastrow
+                        .min(None)
+                        .map(|s| s.item::<f32>())
+                        .unwrap_or(f32::NAN);
+                    format!("mask{:?} lastrow_sum={sum:.2} min={minv:.2}", m.shape())
+                }
+                None => "mask=None".to_string(),
+            };
             eprintln!(
-                "ATTN kshape={:?} q_last_l2={:.4} k_pos0_l2={:.4} k_last_l2={:.4} v_pos0_l2={:.4} v_last_l2={:.4}",
+                "ATTN kshape={:?} q_last={:.4} k_all={:.4} v_all={:.4} {mask_info}",
                 keys.shape(),
                 l2(queries.index((0, 0, -1, ..))),
-                l2(keys.index((0, 0, 0, ..))),
-                l2(keys.index((0, 0, -1, ..))),
-                l2(values.index((0, 0, 0, ..))),
-                l2(values.index((0, 0, -1, ..))),
+                l2(keys.index((0, 0, .., ..))),
+                l2(values.index((0, 0, .., ..))),
             );
         }
 
-        let output = crate::utils::scaled_dot_product_attention(
+        let attn = crate::utils::scaled_dot_product_attention(
             queries, keys, values, cache, self.scale, mask,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+        )?;
+        if std::env::var("ROZUM_ATTN_DEBUG").is_ok() {
+            let l2 = |a: Array| -> f32 {
+                a.square()
+                    .and_then(|s| s.sum(None))
+                    .and_then(|s| s.sqrt())
+                    .map(|s| s.item::<f32>())
+                    .unwrap_or(f32::NAN)
+            };
+            eprintln!(
+                "ATTNOUT all_heads_last_l2={:.4} h0={:.4} h31={:.4}",
+                l2(attn.index((0, .., -1, ..))),
+                l2(attn.index((0, 0, -1, ..))),
+                l2(attn.index((0, 31, -1, ..))),
+            );
+        }
+        let output = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
 
         self.o_proj.forward(&output)
     }
