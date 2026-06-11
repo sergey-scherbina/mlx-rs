@@ -389,7 +389,7 @@ pub struct ModelInput<'a, C> {
 
 impl<C> Module<ModelInput<'_, C>> for Qwen3Model
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     type Output = Array;
 
@@ -416,7 +416,9 @@ where
         };
 
         if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| None).collect();
+            // Slots must be Some so attention actually writes/reads KV history;
+            // a None slot makes attention run cache-less (no context in decode).
+            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
@@ -480,7 +482,7 @@ impl Model {
 
 impl<C> Module<ModelInput<'_, C>> for Model
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     type Output = Array;
 
@@ -637,7 +639,7 @@ macro_rules! tri {
 
 impl<'a, C> Iterator for Generate<'a, C>
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     type Item = Result<Array, Exception>;
 
