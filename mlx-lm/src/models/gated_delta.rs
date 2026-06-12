@@ -289,6 +289,187 @@ mod tests {
     use super::*;
     use mlx_rs::transforms::eval;
 
+    // Raw kernel call with EXPLICIT eval control (bypasses the env gate), so one
+    // test can A/B per-call-eval vs eval-at-end.
+    fn run_kernel_eval(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+        state: Option<Array>,
+        do_eval: bool,
+    ) -> (Array, Array) {
+        let qs = q.shape();
+        let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
+        let vs = v.shape();
+        let (hv, dv) = (vs[2], vs[3]);
+        let state = state.unwrap_or_else(|| zeros::<f32>(&[b, hv, dv, dk]).unwrap());
+        let t_scalar = Array::from_int(t);
+        let template = [
+            mlx_rs::fast::TemplateArg::Dtype("InT", q.dtype()),
+            mlx_rs::fast::TemplateArg::Dtype("StT", state.dtype()),
+            mlx_rs::fast::TemplateArg::Int("Dk", dk),
+            mlx_rs::fast::TemplateArg::Int("Dv", dv),
+            mlx_rs::fast::TemplateArg::Int("Hk", hk),
+            mlx_rs::fast::TemplateArg::Int("Hv", hv),
+        ];
+        let y_shape = [b, t, hv, dv];
+        let st_shape = [b, hv, dv, dk];
+        let outs = gated_delta_metal_kernel()
+            .apply(
+                &[q, k, v, g, beta, &state, &t_scalar],
+                &template,
+                (32, dv, b * hv),
+                (32, 4, 1),
+                &[&y_shape[..], &st_shape[..]],
+                &[q.dtype(), state.dtype()],
+                mlx_rs::StreamOrDevice::default(),
+            )
+            .unwrap();
+        if do_eval {
+            eval([&outs[0], &outs[1]]).unwrap();
+        }
+        (outs[0].clone(), outs[1].clone())
+    }
+
+    // Attempt to reproduce the GatedDeltaNet `state_out` buffer-donation hazard in
+    // ISOLATION — no model, no 27B. A decode-like forward of N "layers": each layer
+    // derives q/k/v/g/beta from a running `hidden`, runs the real kernel, stores the
+    // new state in a `cache`, adds the kernel output into `hidden` (residual). A
+    // SECOND token reads the cached states. A/Bs per-call-eval vs eval-at-end.
+    //
+    // RESULT (2026-06-12): does NOT reproduce (max|Δ|=0) even with the conv cache, a
+    // growing ConcatKV-style cache (every 4th layer), an MLP, 4-bit AFQ quantized
+    // matmuls, real dims (d=5120, 64 layers, Hv=48/Dk=Dv=128) and 8 tokens. So the
+    // token-2 garbage in the real 27B is NOT caused by the mlx-rs binding, the
+    // kernel, the caches, quantization, or graph depth in isolation. The leading
+    // remaining difference is real memory pressure (the model holds ~15 GB of
+    // DISTINCT per-layer weights; this test shares weights so MLX always mallocs
+    // fresh and never recycles a held buffer). Next step to root-cause: instrument
+    // MLX core's MetalAllocator on the real model, or run this under real pressure.
+    //   cargo test -p mlx-lm --release gated_delta_donation_repro -- --nocapture
+    #[test]
+    fn gated_delta_donation_repro() {
+        use mlx_rs::ops::matmul;
+        let (b, hk, hv, dk, dv) = (1, 16, 48, 128, 128);
+        let d = 5120i32;
+        let n_layers = 64usize;
+        let n_tokens = 8usize;
+        let bf = mlx_rs::Dtype::Bfloat16;
+        let f32t = mlx_rs::Dtype::Float32;
+
+        // Deterministic small weights (no RNG): keep activations bounded over depth.
+        let det = |rows: i32, cols: i32, seed: f32| -> Array {
+            let n = (rows * cols) as usize;
+            let v: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.0007 + seed).sin() * 0.02)
+                .collect();
+            Array::from_slice(&v, &[rows, cols]).as_dtype(bf).unwrap()
+        };
+        // 4-bit AFQ quantized weights ([out,in]; quantized_matmul transpose=true) —
+        // the real model is quantized, the last big structural difference. The g/beta
+        // gates stay plain (hv=48 isn't a multiple of 32, so not quantizable).
+        let inter = 17408i32;
+        let mkq = |out: i32, inn: i32, seed: f32| -> (Array, Array, Array) {
+            mlx_rs::ops::quantize(&det(out, inn, seed), 64, 4).unwrap()
+        };
+        let wq = mkq(hk * dk, d, 0.1);
+        let wk = mkq(hk * dk, d, 0.2);
+        let wv = mkq(hv * dv, d, 0.3);
+        let wg = det(d, hv, 0.4);
+        let wb = det(d, hv, 0.5);
+        let wo = mkq(d, hv * dv, 0.6);
+        let w_up = mkq(inter, d, 0.7);
+        let w_down = mkq(d, inter, 0.8);
+        let w_attn_qkv = mkq(hk * dk, d, 0.9);
+        let w_attn_o = mkq(d, hk * dk, 1.1);
+        let qmm = |x: &Array, w: &(Array, Array, Array)| -> Array {
+            mlx_rs::ops::quantized_matmul(x, &w.0, &w.1, Some(&w.2), true, 64, 4).unwrap()
+        };
+
+        // cache: (recurrent state, conv state, kv-k, kv-v) per layer.
+        type Cache = Vec<(Option<Array>, Option<Array>, Option<Array>, Option<Array>)>;
+        let conv_k = 4i32;
+        let forward = |hidden0: &Array, cache: &mut Cache, do_eval: bool| -> Array {
+            let mut hidden = hidden0.clone(); // [1,1,d] bf16
+            for l in 0..n_layers {
+                let hflat = hidden.reshape(&[b, d]).unwrap();
+                if l % 4 == 3 {
+                    // "full attention": GROWING KV concat (the realloc churn).
+                    let qn = qmm(&hflat, &w_attn_qkv).reshape(&[b, 1, hk * dk]).unwrap();
+                    let kc = match cache[l].2.take() {
+                        Some(prev) => mlx_rs::ops::concatenate_axis(&[&prev, &qn], 1).unwrap(),
+                        None => qn.clone(),
+                    };
+                    cache[l].2 = Some(kc.clone());
+                    // a cheap "attention": mean over the growing cache, project back.
+                    let ctx = kc.mean_axes(&[1], false).unwrap(); // [b, hk*dk]
+                    let delta = qmm(&ctx, &w_attn_o).reshape(&[b, 1, d]).unwrap();
+                    hidden = hidden.add(&delta).unwrap();
+                } else {
+                    // linear (GatedDeltaNet): conv cache (small concat) + the kernel.
+                    let qkv = qmm(&hflat, &wq).reshape(&[b, 1, hk * dk]).unwrap();
+                    let prev = match cache[l].1.take() {
+                        Some(s) => s,
+                        None => zeros::<f32>(&[b, conv_k - 1, hk * dk]).unwrap().as_dtype(bf).unwrap(),
+                    };
+                    let conv_in = mlx_rs::ops::concatenate_axis(&[&prev, &qkv], 1).unwrap();
+                    let tot = conv_in.shape()[1];
+                    cache[l].1 = Some(conv_in.index((.., (tot - (conv_k - 1))..tot, ..)));
+                    let q = qkv.reshape(&[b, 1, hk, dk]).unwrap();
+                    let k = qmm(&hflat, &wk).reshape(&[b, 1, hk, dk]).unwrap();
+                    let v = qmm(&hflat, &wv).reshape(&[b, 1, hv, dv]).unwrap();
+                    let g = mlx_rs::nn::sigmoid(&matmul(&hflat, &wg).unwrap())
+                        .unwrap().as_dtype(f32t).unwrap().reshape(&[b, 1, hv]).unwrap();
+                    let beta = mlx_rs::nn::sigmoid(&matmul(&hflat, &wb).unwrap())
+                        .unwrap().reshape(&[b, 1, hv]).unwrap();
+                    let (y, ns) = run_kernel_eval(&q, &k, &v, &g, &beta, cache[l].0.take(), do_eval);
+                    cache[l].0 = Some(ns);
+                    let yflat = y.reshape(&[b, hv * dv]).unwrap();
+                    let delta = qmm(&yflat, &wo).reshape(&[b, 1, d]).unwrap();
+                    hidden = hidden.add(&delta).unwrap();
+                }
+                // MLP (large intermediate every layer).
+                let hf = hidden.reshape(&[b, d]).unwrap();
+                let up = mlx_rs::nn::silu(&qmm(&hf, &w_up)).unwrap();
+                let down = qmm(&up, &w_down).reshape(&[b, 1, d]).unwrap();
+                hidden = hidden.add(&down).unwrap();
+            }
+            hidden
+        };
+
+        let run = |do_eval: bool| -> Vec<Array> {
+            let mut cache: Cache = (0..n_layers).map(|_| (None, None, None, None)).collect();
+            let mut hidden = det(b, d, 1.0).reshape(&[b, 1, d]).unwrap();
+            let mut outs = Vec::new();
+            for _ in 0..n_tokens {
+                hidden = forward(&hidden, &mut cache, do_eval);
+                eval([&hidden]).unwrap();
+                outs.push(hidden.reshape(&[-1]).unwrap().as_dtype(f32t).unwrap());
+            }
+            outs
+        };
+
+        let refs = run(true); // per-call eval = correct reference
+        let cand = run(false); // eval at end = candidate (no per-call eval)
+
+        let mut max_any = 0f32;
+        for t in 0..n_tokens {
+            eval([&refs[t], &cand[t]]).unwrap();
+            let a = refs[t].as_slice::<f32>();
+            let c = cand[t].as_slice::<f32>();
+            let md = a
+                .iter()
+                .zip(c.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            max_any = max_any.max(md);
+            eprintln!("REPRO token {t}: max|Δ| = {md:.5}");
+        }
+        eprintln!("REPRO overall max|Δ| = {max_any:.5}  ({})", if max_any > 1e-2 { "REPRODUCED (no-eval diverges)" } else { "no divergence" });
+    }
+
     // Reference values from Python mlx_lm.models.gated_delta.gated_delta_ops
     // (seed 0; B=1,T=3,Hk=1,Hv=2,Dk=4,Dv=4; scalar gating).
     #[test]
