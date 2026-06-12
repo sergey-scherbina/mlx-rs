@@ -3,9 +3,12 @@
 //! Each decoder layer's MLP is a router (`gate`) over `num_experts` experts,
 //! top-`k` of which run as a fused `SwitchGLU`. The attention block is byte-for
 //! -byte the dense Qwen3 one, so it is reused verbatim (incl. the L=1 RoPE fix).
-//! Experts are AFQ-quantized and evaluated with `gather_qmm`; sorting the tokens
-//! by expert (a pure memory-access optimization in Python `mlx_lm`) is skipped
-//! since `gather_qmm` is numerically identical sorted or not.
+//! Experts are AFQ-quantized and evaluated with `gather_qmm`. For prefill (many
+//! routed slots) the tokens are sorted by expert and `gather_qmm` is told the
+//! indices are sorted (`sorted_indices=true`), so each expert's rows are accessed
+//! contiguously — a pure memory-access optimization (byte-identical output),
+//! mirroring Python `mlx_lm`'s `SwitchGLU` `_gather_sort`/`_scatter_unsort`. At
+//! decode (T=1, few slots) sorting is skipped, exactly as Python does.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -20,7 +23,7 @@ use mlx_rs::{
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
-        argpartition_axis, expand_dims_axes, gather_qmm,
+        argpartition_axis, argsort_axis, expand_dims_axes, gather_qmm, unflatten,
         indexing::{take_along_axis, IndexOp},
         softmax_axis,
     },
@@ -119,7 +122,7 @@ impl QSwitchLinear {
         }
     }
 
-    fn forward(&self, x: &Array, indices: &Array) -> Result<Array, Exception> {
+    fn forward(&self, x: &Array, indices: &Array, sorted: bool) -> Result<Array, Exception> {
         gather_qmm(
             x,
             &self.weight.value,
@@ -130,7 +133,7 @@ impl QSwitchLinear {
             true,
             self.group_size,
             self.bits,
-            false,
+            sorted,
         )
     }
 }
@@ -158,11 +161,35 @@ impl SwitchGlu {
 
     /// `x`: `[B, L, D]`, `indices`: `[B, L, k]` -> `[B, L, k, D]`.
     pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array, Exception> {
-        let x = expand_dims_axes(x, &[-2, -3])?;
-        let x_up = self.up_proj.forward(&x, indices)?;
-        let x_gate = self.gate_proj.forward(&x, indices)?;
+        let x = expand_dims_axes(x, &[-2, -3])?; // [B, L, 1, 1, D]
+
+        // Many routed slots (prefill): sort the per-(token,slot) rows by expert id
+        // so `gather_qmm` reads each expert's weights contiguously, then scatter the
+        // result back. Identical math (a permutation undone by `inv_order`); only the
+        // memory-access order changes. Skipped at decode (T=1) where it does not pay.
+        if indices.size() >= 64 {
+            let sh = indices.shape().to_vec(); // [B, L, k]
+            let (b, l, k) = (sh[0], sh[1], sh[2]);
+            let idx_flat = indices.flatten(0, -1)?; // [B*L*k]
+            let order = argsort_axis(&idx_flat, -1)?; // [B*L*k], ascending by expert
+            let inv_order = argsort_axis(&order, -1)?; // inverse permutation
+            let token_of_slot = order.floor_divide(Array::from_int(k))?; // [B*L*k]
+            let xs = x.flatten(0, -3)?.take_axis(&token_of_slot, 0)?; // [B*L*k, 1, D]
+            let idx_sorted = idx_flat.take_axis(&order, 0)?; // [B*L*k], sorted
+
+            let x_up = self.up_proj.forward(&xs, &idx_sorted, true)?;
+            let x_gate = self.gate_proj.forward(&xs, &idx_sorted, true)?;
+            let act = nn::silu(&x_gate)?.multiply(&x_up)?;
+            let out = self.down_proj.forward(&act, &idx_sorted, true)?; // [B*L*k, 1, D]
+
+            let out = out.take_axis(&inv_order, 0)?; // undo the sort
+            return unflatten(&out, 0, &[b, l, k])?.squeeze_axes(&[-2]); // [B, L, k, D]
+        }
+
+        let x_up = self.up_proj.forward(&x, indices, false)?;
+        let x_gate = self.gate_proj.forward(&x, indices, false)?;
         let act = nn::silu(&x_gate)?.multiply(&x_up)?;
-        let out = self.down_proj.forward(&act, indices)?;
+        let out = self.down_proj.forward(&act, indices, false)?;
         out.squeeze_axes(&[-2])
     }
 }
