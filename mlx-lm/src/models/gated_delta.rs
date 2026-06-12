@@ -243,13 +243,17 @@ pub fn gated_delta_kernel(
         &[q.dtype(), state.dtype()],
         mlx_rs::StreamOrDevice::default(),
     )?;
-    // Force materialization. On MLX 0.30.6 the custom-kernel primitive's lazy
-    // `state_out` gets buffer-donated by the ~60 later layers of the forward before
-    // it materializes → garbage at token 2; a per-call `eval` fixes it. This is the
-    // ~48-sync/token cost that blocks hybrid decode pipelining. MLX 0.31.2 fixes the
-    // donation upstream (Python's kernel needs no eval), so `ROZUM_GD_NO_EVAL=1` tests
-    // whether we can drop it on the bumped MLX. Default keeps the eval (always safe).
-    if std::env::var_os("ROZUM_GD_NO_EVAL").is_none() {
+    // Blocking per-call eval of the kernel outputs (REQUIRED for correctness on
+    // MLX 0.30.6). The custom-kernel `state_out` must be materialized in a SMALL
+    // graph (just this kernel) so its buffer is concrete+held before the ~60 later
+    // layers of the forward run; otherwise MLX's planner donates/pool-reuses it
+    // inside the big forward graph -> token-2 garbage. Empirically only a *blocking*
+    // kernel-local eval works: `async_eval`, an end-of-token eval of the cache
+    // states as graph OUTPUTS, and decode pipelining all still corrupt (2026-06-12).
+    // This costs ~48 syncs/token and is the ~12-vs-17 t/s decode gap; dropping it
+    // needs the underlying MLX buffer-donation behavior to change (upstream).
+    // `ROZUM_GD_NONE=1` skips it (fast but corrupts — A/B measurement only).
+    if std::env::var_os("ROZUM_GD_NONE").is_none() {
         mlx_rs::transforms::eval([&outs[0], &outs[1]])?;
     }
     Ok((outs[0].clone(), outs[1].clone()))
