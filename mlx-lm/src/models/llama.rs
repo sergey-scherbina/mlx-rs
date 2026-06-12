@@ -9,7 +9,7 @@ use mlx_rs::{
     categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt},
+    module::{Module, ModuleParameters, ModuleParametersExt},
     nn,
     ops::indexing::{IndexOp, NewAxis},
     quantization::MaybeQuantized,
@@ -22,6 +22,9 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    // The sampler is model-agnostic (operates on logit arrays); reuse qwen3's so
+    // Llama gets top-p/top-k/repeat-penalty parity without duplicating it.
+    models::qwen3::{repeat_window, sample_with, QuantizationConfig, SamplerOpts},
     utils::rope::{initialize_rope, FloatOrString, RopeVariant},
 };
 
@@ -45,6 +48,9 @@ pub struct ModelArgs {
     #[serde(default)]
     pub mlp_bias: bool,
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    /// Present on pre-quantized (AFQ) mlx-community checkpoints; drives the
+    /// `nn::quantize` build before the weights load. `None` = full precision.
+    pub quantization: Option<QuantizationConfig>,
 }
 
 fn default_true() -> bool {
@@ -508,24 +514,59 @@ pub struct WeightMap {
 pub fn load_llama_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_llama_model_args(model_dir)?;
+    let quantization = model_args.quantization.clone();
     let mut model = Model::new(model_args)?;
 
+    // Pre-quantized mlx-community checkpoints ship AFQ weight/scales/biases; build
+    // the matching QuantizedLinear structure before loading so the keys line up.
+    if let Some(q) = quantization {
+        model = mlx_rs::nn::quantize(model, q.group_size, q.bits)?;
+    }
+
+    // mlx-rs QuantizedLinear/QuantizedEmbedding nest the packed weight under
+    // `<prefix>.inner.weight`, but mlx-community checkpoints store it as
+    // `<prefix>.weight`. Remap `<prefix>.weight` -> `<prefix>.inner.weight`
+    // whenever a sibling `<prefix>.scales` is present (i.e. a quantized layer);
+    // leave norm and other `.weight` keys untouched. load_safetensors is
+    // non-strict (skips unmatched keys silently), so without this the packed
+    // weights stay at their random init and the model emits garbage.
+    fn load_weights_remapped(model: &mut Model, file: &Path) -> Result<usize, Error> {
+        let loaded = mlx_rs::Array::load_safetensors(file)?;
+        let has_scales: HashSet<String> = loaded
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+            .collect();
+        let mut params = model.parameters_mut().flatten();
+        let mut matched = 0usize;
+        for (key, value) in loaded {
+            let mapped = match key.strip_suffix(".weight") {
+                Some(prefix) if has_scales.contains(prefix) => format!("{prefix}.inner.weight"),
+                _ => key,
+            };
+            if let Some(param) = params.get_mut(mapped.as_str()) {
+                **param = value;
+                matched += 1;
+            }
+        }
+        Ok(matched)
+    }
+
     let weights_index = model_dir.join("model.safetensors.index.json");
+    let mut matched = 0usize;
     if weights_index.exists() {
-        // Sharded weights: read the index to find all weight files
         let json = std::fs::read_to_string(weights_index)?;
         let weight_map: WeightMap = serde_json::from_str(&json)?;
-
         let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
         for weight_file in weight_files {
-            let weights_filename = model_dir.join(weight_file);
-            model.load_safetensors(weights_filename)?;
+            matched += load_weights_remapped(&mut model, &model_dir.join(weight_file))?;
         }
     } else {
-        // Single weight file
-        let weights_filename = model_dir.join("model.safetensors");
-        model.load_safetensors(weights_filename)?;
+        matched = load_weights_remapped(&mut model, &model_dir.join("model.safetensors"))?;
     }
+    if std::env::var("ROZUM_MLX_DEBUG").is_ok() {
+        eprintln!("LOADED {matched} params (llama)");
+    }
+    model.eval()?;
 
     Ok(model)
 }
@@ -543,13 +584,14 @@ pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
-    temp: f32,
+    sampler: SamplerOpts,
+    history: Vec<u32>,
     state: GenerateState<'a>,
 }
 
 impl<'a, C> Generate<'a, C>
 where
-    C: KeyValueCache + Default,
+    C: KeyValueCache,
 {
     pub fn new(
         model: &'a mut Model,
@@ -560,9 +602,17 @@ where
         Self {
             model,
             cache,
-            temp,
+            sampler: SamplerOpts::with_temp(temp),
+            history: Vec::new(),
             state: GenerateState::Prefill { prompt_token },
         }
+    }
+
+    /// Set top-p / top-k / repeat-penalty (temp came from `new`).
+    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
+        self.sampler.top_p = top_p;
+        self.sampler.top_k = top_k;
+        self.sampler.repeat_penalty = repeat_penalty;
     }
 }
 
@@ -595,7 +645,16 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+                    repeat_window(&self.history)
+                } else {
+                    &[]
+                };
+                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler, recent));
+                if self.sampler.repeat_penalty != 1.0 {
+                    tri!(mlx_rs::transforms::eval([&y]));
+                    self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
+                }
                 self.state = GenerateState::Decode { y: y.clone() };
 
                 Some(Ok(y))
@@ -608,7 +667,16 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
+                    repeat_window(&self.history)
+                } else {
+                    &[]
+                };
+                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler, recent));
+                if self.sampler.repeat_penalty != 1.0 {
+                    tri!(mlx_rs::transforms::eval([&y]));
+                    self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
+                }
 
                 self.state = GenerateState::Decode { y: y.clone() };
 
