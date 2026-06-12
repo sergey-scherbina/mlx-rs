@@ -243,24 +243,22 @@ pub fn gated_delta_kernel(
         &[q.dtype(), state.dtype()],
         mlx_rs::StreamOrDevice::default(),
     )?;
-    // A blocking per-call GPU sync is REQUIRED for correctness when this kernel runs
-    // inside the full Qwen3.6 forward; without it the run produces garbage from the
-    // 2nd token. Root-cause dig (2026-06-12) — it is NOT what the old comment claimed
-    // (state_out buffer donation):
-    //   * MLX's allocator never hands out a held state buffer (instrumented
-    //     MetalAllocator: 0 state-sized buffers reused while live);
-    //   * disabling buffer reuse-from-cache (MLX patch) does NOT fix it;
-    //   * forcing one giant command buffer (MLX_MAX_OPS_PER_BUFFER) does NOT fix it;
-    //   * evaling ANY live per-layer intermediate fixes it — the kernel's projection
-    //     INPUTS (q/k/v or g/beta) suffice; evaling the already-concrete cache state
-    //     does not. So a per-layer GPU sync is what matters, not which array.
-    //   * a faithful standalone repro (kernel + caches + 4-bit quant + real dims, no
-    //     eval) stays byte-exact — it only manifests in the full 27B/35B model.
-    // => an MLX metal-backend execution-ordering / buffer-lifetime issue at graph
-    // scale (the kernel reads not-yet-ready input values), papered over by the sync.
-    // Cost: ~48 syncs/token = the ~12-vs-17 t/s decode gap. `ROZUM_GD_NONE=1` skips
-    // it (fast but corrupts — A/B only).
-    if std::env::var_os("ROZUM_GD_NONE").is_none() {
+    // ROOT CAUSE (2026-06-12): in the full Qwen3.6 forward a buffer feeding this
+    // custom kernel's input is freed/reused before the in-flight GPU dispatch reads
+    // it (MLX creates command buffers with UNRETAINED references) -> garbage from the
+    // 2nd token. NOT state_out donation (the allocator never reuses a held state
+    // buffer), NOT buffer reuse-from-cache, NOT command-buffer size. Python `mlx_lm`
+    // (same MLX) is correct serially with no eval — its op graph just doesn't free the
+    // offending buffer. See docs/mlx-gd-bug/.
+    //
+    // Two ways to make it correct: (a) a blocking per-call eval forces GPU completion
+    // before the buffer is freed — the default, but ~48 syncs/token (the ~12-vs-17
+    // t/s decode gap); (b) RETAINED command-buffer refs keep the buffer alive — the
+    // backend enables them for hybrid models via `ROZUM_MLX_RETAIN`, and then the eval
+    // is unnecessary. `ROZUM_GD_NONE=1` forces no-eval for A/B (corrupts without (b)).
+    let skip_eval = std::env::var_os("ROZUM_MLX_RETAIN").is_some()
+        || std::env::var_os("ROZUM_GD_NONE").is_some();
+    if !skip_eval {
         mlx_rs::transforms::eval([&outs[0], &outs[1]])?;
     }
     Ok((outs[0].clone(), outs[1].clone()))

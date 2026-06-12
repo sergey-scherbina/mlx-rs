@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         chat_template_id: None,
         add_generation_prompt: Some(true),
         continue_final_message: None,
+        tools: None,
     };
     let encodings = tokenizer.apply_chat_template_and_encode(chat_template, args)?;
     let prompt: Vec<u32> = encodings
