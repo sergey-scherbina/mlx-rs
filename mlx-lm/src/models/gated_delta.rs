@@ -424,8 +424,14 @@ mod tests {
                     let conv_in = mlx_rs::ops::concatenate_axis(&[&prev, &qkv], 1).unwrap();
                     let tot = conv_in.shape()[1];
                     cache[l].1 = Some(conv_in.index((.., (tot - (conv_k - 1))..tot, ..)));
-                    let q = qkv.reshape(&[b, 1, hk, dk]).unwrap();
-                    let k = qmm(&hflat, &wk).reshape(&[b, 1, hk, dk]).unwrap();
+                    // L6: fast::rms_norm (weightless) on q,k like the real model.
+                    let rmsn = |x: &Array| -> Array {
+                        let dl = *x.shape().last().unwrap();
+                        let w = Array::ones::<f32>(&[dl]).unwrap().as_dtype(x.dtype()).unwrap();
+                        mlx_rs::fast::rms_norm(x, &w, 1e-6).unwrap()
+                    };
+                    let q = rmsn(&qkv.reshape(&[b, 1, hk, dk]).unwrap());
+                    let k = rmsn(&qmm(&hflat, &wk).reshape(&[b, 1, hk, dk]).unwrap());
                     let v = qmm(&hflat, &wv).reshape(&[b, 1, hv, dv]).unwrap();
                     let g = mlx_rs::nn::sigmoid(&matmul(&hflat, &wg).unwrap())
                         .unwrap().as_dtype(f32t).unwrap().reshape(&[b, 1, hv]).unwrap();
