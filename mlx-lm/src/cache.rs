@@ -1,4 +1,12 @@
-use mlx_rs::{error::Exception, ops::concatenate_axis, Array};
+use mlx_rs::{
+    error::Exception,
+    ops::{
+        concatenate_axis,
+        indexing::{IndexOp, TryIndexMutOp},
+        zeros_dtype,
+    },
+    Array,
+};
 
 // TODO: somehow move quantized methods to a separate trait?
 pub trait KeyValueCache {
@@ -57,6 +65,18 @@ where
     }
 }
 
+/// Block size (positions) the KV buffers grow by. Matches Python `mlx_lm`'s
+/// `KVCache.step`.
+const KV_STEP: i32 = 256;
+
+/// KV cache that pre-allocates its key/value buffers in [`KV_STEP`]-sized blocks
+/// and writes each step in place (`slice_update`), returning a view of the used
+/// prefix — instead of re-`concatenate`-ing (and reallocating) the entire history
+/// every decode step. Mirrors Python `mlx_lm`'s `KVCache`: byte-identical output,
+/// but the per-step O(context) copy becomes an amortised O(1) write (one growth
+/// `concatenate` every [`KV_STEP`] steps). `offset` is the used length; the
+/// buffers' `[-2]` length is the (>= offset) capacity. (The name is kept for
+/// call-site compatibility; it no longer concatenates per step.)
 #[derive(Debug, Clone, Default)]
 pub struct ConcatKeyValueCache {
     keys: Option<Array>,
@@ -69,10 +89,19 @@ impl ConcatKeyValueCache {
         Self::default()
     }
 
-    /// The cache's live arrays, for forcing materialization (e.g. between
-    /// prefill chunks, so each chunk's activations are freed before the next).
+    /// The cache's live arrays (full pre-allocated buffers), for forcing
+    /// materialization (e.g. between prefill chunks, so each chunk's activations
+    /// are freed before the next).
     pub fn state_arrays(&self) -> impl Iterator<Item = &Array> {
         self.keys.iter().chain(self.values.iter())
+    }
+
+    /// Allocated capacity along the sequence axis (`>= offset`).
+    fn capacity(&self) -> i32 {
+        self.keys.as_ref().map_or(0, |k| {
+            let s = k.shape();
+            s[s.len() - 2]
+        })
     }
 }
 
@@ -90,22 +119,57 @@ impl KeyValueCache for ConcatKeyValueCache {
         keys: Array,
         values: Array,
     ) -> Result<(Array, Array), Exception> {
-        match (self.keys.take(), self.values.take()) {
-            (Some(k), Some(v)) => {
-                self.keys = Some(concatenate_axis(&[k, keys], -2)?);
-                self.values = Some(concatenate_axis(&[v, values], -2)?);
-            }
-            _ => {
-                self.keys = Some(keys);
-                self.values = Some(values);
+        let ks = keys.shape().to_vec(); // [B, H, L, Dk]
+        let (b, h, l, dk) = (ks[0], ks[1], ks[2], ks[3]);
+        let dv = *values.shape().last().unwrap();
+        let prev = self.offset;
+
+        // Grow only when the buffer can't hold L more positions — i.e. roughly
+        // once every KV_STEP decode steps, not every step.
+        if self.keys.is_none() || prev + l > self.capacity() {
+            let n_steps = (KV_STEP + l - 1) / KV_STEP;
+            let add = n_steps * KV_STEP;
+            let new_k = zeros_dtype(&[b, h, add, dk], keys.dtype())?;
+            let new_v = zeros_dtype(&[b, h, add, dv], values.dtype())?;
+            match (self.keys.take(), self.values.take()) {
+                (Some(k), Some(v)) => {
+                    // Drop a partially-filled trailing block before appending.
+                    let (k, v) = if prev % KV_STEP != 0 {
+                        (k.index((.., .., ..prev, ..)), v.index((.., .., ..prev, ..)))
+                    } else {
+                        (k, v)
+                    };
+                    self.keys = Some(concatenate_axis(&[k, new_k], -2)?);
+                    self.values = Some(concatenate_axis(&[v, new_v], -2)?);
+                }
+                _ => {
+                    self.keys = Some(new_k);
+                    self.values = Some(new_v);
+                }
             }
         }
-        let shape = self.keys.as_ref().expect("Keys cannot be None").shape();
-        self.offset = shape[shape.len() - 2];
 
+        self.offset = prev + l;
+        // Write this step's keys/values in place at [.., .., prev:offset, ..].
+        self.keys
+            .as_mut()
+            .expect("keys")
+            .try_index_mut((.., .., prev..self.offset, ..), keys)?;
+        self.values
+            .as_mut()
+            .expect("values")
+            .try_index_mut((.., .., prev..self.offset, ..), values)?;
+
+        // Return a view of the used prefix (length == offset).
         Ok((
-            self.keys.clone().expect("Keys cannot be None"),
-            self.values.clone().expect("Values cannot be None"),
+            self.keys
+                .as_ref()
+                .unwrap()
+                .index((.., .., ..self.offset, ..)),
+            self.values
+                .as_ref()
+                .unwrap()
+                .index((.., .., ..self.offset, ..)),
         ))
     }
 }
