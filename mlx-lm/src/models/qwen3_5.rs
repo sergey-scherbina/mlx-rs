@@ -418,9 +418,15 @@ impl GatedDeltaNet {
         let v = qkv_parts[2].reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
 
         // Per-head L2 (weightless) normalize + the delta-rule scaling on q/k.
+        // Scale by a scalar IN q/k's dtype (Python multiplies by a python float,
+        // which keeps bf16); a strong f32 `Array::from_f32` would promote the whole
+        // stream to f32 -> ~1000 spurious weight-casts/token downstream. See
+        // docs/mlx-gd-bug: the f32 leak started here.
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q = rms_norm_weightless(&q, 1e-6)?.multiply(Array::from_f32(inv_scale * inv_scale))?;
-        let k = rms_norm_weightless(&k, 1e-6)?.multiply(Array::from_f32(inv_scale))?;
+        let qn = rms_norm_weightless(&q, 1e-6)?;
+        let q = qn.multiply(Array::from_f32(inv_scale * inv_scale).as_dtype(qn.dtype())?)?;
+        let kn = rms_norm_weightless(&k, 1e-6)?;
+        let k = kn.multiply(Array::from_f32(inv_scale).as_dtype(kn.dtype())?)?;
 
         let (out, new_state) = gated_delta_update(
             &q,

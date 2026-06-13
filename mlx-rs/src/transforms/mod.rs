@@ -91,6 +91,16 @@ pub fn async_eval_params(params: ModuleParamRef<'_>) -> Result<()> {
     async_eval(params.flatten().values().copied())
 }
 
+/// rozum (perf debugging): dump the DAG of `outputs` to `path` in Graphviz DOT.
+/// Counting the primitive nodes gives the per-eval op/dispatch count.
+pub fn export_to_dot<'a>(path: &str, outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
+    let vec = VectorArray::try_from_iter(outputs.into_iter())?;
+    let cpath = std::ffi::CString::new(path).expect("nul-free path");
+    <() as Guarded>::try_from_op(|_| unsafe {
+        mlx_sys::mlx_export_to_dot(cpath.as_ptr(), vec.as_ptr())
+    })
+}
+
 #[inline]
 fn jvp_inner(
     closure: Closure<'_>,
