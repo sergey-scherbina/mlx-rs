@@ -116,12 +116,11 @@ impl ModelArgs {
     }
 }
 
-/// Weightless RMS norm over the last axis (`mx.fast.rms_norm(x, None, eps)`):
-/// pass a ones weight in `x`'s dtype.
+/// Weightless RMS norm over the last axis (`mx.fast.rms_norm(x, None, eps)`).
+/// Uses the null-weight fast kernel — no per-call ones weight (which would add a
+/// `Full`+`AsType` to the graph every call).
 fn rms_norm_weightless(x: &Array, eps: f32) -> Result<Array, Exception> {
-    let d = *x.shape().last().unwrap();
-    let w = Array::ones::<f32>(&[d])?.as_dtype(x.dtype())?;
-    mlx_rs::fast::rms_norm(x, &w, eps)
+    mlx_rs::fast::rms_norm_no_weight(x, eps)
 }
 
 /// RMSNorm with an optional SwiGLU-style gate: `silu(gate) * rms_norm(x, w)`.

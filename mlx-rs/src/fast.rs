@@ -218,6 +218,32 @@ pub fn rms_norm_device(
     })
 }
 
+/// `mx.fast.rms_norm(x, None, eps)` — RMS norm with **no** weight. The C API takes a
+/// null weight (`weight.ctx == nullptr` -> `std::nullopt`), so this avoids building a
+/// per-call ones weight (which shows up as a `Full`+`AsType` in the graph every call).
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn rms_norm_no_weight_device(
+    x: impl AsRef<Array>,
+    eps: f32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let null_weight = unsafe { mlx_sys::mlx_array_new() };
+    let result = Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_fast_rms_norm(
+            res,
+            x.as_ref().as_ptr(),
+            null_weight,
+            eps,
+            stream.as_ref().as_ptr(),
+        )
+    });
+    unsafe {
+        mlx_sys::mlx_array_free(null_weight);
+    }
+    result
+}
+
 /// Layer normalization.
 ///
 /// The normalization is with respect to the last axis of the input `x`.
