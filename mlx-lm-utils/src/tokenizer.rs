@@ -240,6 +240,11 @@ where
     pub chat_template_id: Option<&'a str>,
     pub add_generation_prompt: Option<bool>,
     pub continue_final_message: Option<bool>,
+    /// Exposed to the template as the `enable_thinking` variable (Qwen3 etc. use
+    /// it to gate reasoning). `None` defaults to `true` (the template's own
+    /// default); `Some(false)` makes a thinking model emit a closed empty
+    /// `<think></think>` in the PROMPT so its output is clean.
+    pub enable_thinking: Option<bool>,
 }
 
 pub fn load_model_chat_template_from_str(content: &str) -> std::io::Result<Option<String>> {
@@ -448,6 +453,7 @@ where
         chat_template_id,
         add_generation_prompt,
         continue_final_message,
+        enable_thinking,
     } = args;
 
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
@@ -474,6 +480,7 @@ where
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
+        enable_thinking,
     )
 }
 
@@ -485,6 +492,7 @@ fn render_jinja_tempalte<'a, R, T>(
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
+    enable_thinking: Option<bool>,
 ) -> Result<Vec<String>, Error>
 where
     R: Serialize + 'a,
@@ -492,6 +500,10 @@ where
 {
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
     let continue_final_message = continue_final_message.unwrap_or(false);
+    // Default true = the template's own default (reasoning models think). A
+    // caller passing `Some(false)` disables it (e.g. Qwen3 emits a closed empty
+    // `<think></think>` in the prompt, so the generated output is clean).
+    let enable_thinking = enable_thinking.unwrap_or(true);
 
     // TODO: what does checking for "messages" key do in the python code?
     let mut rendered = Vec::new();
@@ -501,6 +513,7 @@ where
             tools => tools,
             documents => documents,
             add_generation_prompt => add_generation_prompt,
+            enable_thinking => enable_thinking,
         })?;
 
         if continue_final_message {
@@ -577,6 +590,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            enable_thinking: None,
         };
 
         let mut env = Environment::new();
@@ -613,6 +627,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            enable_thinking: None,
         };
 
         let rendered_chat = tokenizer
@@ -647,6 +662,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            enable_thinking: None,
         };
 
         let encodings = tokenizer
