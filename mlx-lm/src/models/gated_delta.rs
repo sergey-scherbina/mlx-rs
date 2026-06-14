@@ -590,4 +590,79 @@ mod tests {
             );
         }
     }
+
+    // Foundational proof for HYBRID batched decode: the GatedDeltaNet recurrence is
+    // ROW-INDEPENDENT on the batch axis. Each (b,hv) pair owns a private state slice
+    // (kernel grid z spans `b*hv`, `b_idx = n/Hv`; the ops path broadcasts per-B), so
+    // stacking two sequences' inputs onto B=2 and decoding together must be BYTE-EXACT
+    // to running each alone — no padding, rope, or mask needed for the linear layers
+    // (unlike the full-attn KV, the conv+recurrent state is fixed-size per sequence).
+    // Covers prefill (T=4, distinct per-row inputs) AND a follow-on decode step (T=1)
+    // that reuses each row's carried state — exactly the assemble-then-decode path.
+    //   cargo test -p mlx-lm --release gated_delta_batches_row_independent -- --nocapture
+    #[test]
+    fn gated_delta_batches_row_independent() {
+        let (hk, hv, dk, dv) = (16, 48, 128, 128);
+        let bf = mlx_rs::Dtype::Bfloat16;
+        // Build one row's (q,k,v,g,beta) at [1,T,H,D] from a phase offset, so two rows
+        // with different offsets are genuinely independent sequences.
+        let row = |t: i32, off: f32| -> (Array, Array, Array, Array, Array) {
+            let gen = |n: usize, scale: f32, o: f32| -> Vec<f32> {
+                (0..n).map(|i| ((i as f32) * 0.137 + o).sin() * scale).collect()
+            };
+            let gpos = |n: usize, o: f32| -> Vec<f32> {
+                (0..n).map(|i| 0.5 + 0.49 * ((i as f32) * 0.7 + o).sin()).collect()
+            };
+            let q = Array::from_slice(&gen((t * hk * dk) as usize, 0.5, off), &[1, t, hk, dk])
+                .as_dtype(bf).unwrap();
+            let k = Array::from_slice(&gen((t * hk * dk) as usize, 0.5, off + 1.0), &[1, t, hk, dk])
+                .as_dtype(bf).unwrap();
+            let v = Array::from_slice(&gen((t * hv * dv) as usize, 1.0, off + 2.0), &[1, t, hv, dv])
+                .as_dtype(bf).unwrap();
+            let g = Array::from_slice(&gpos((t * hv) as usize, off), &[1, t, hv]); // f32
+            let beta = Array::from_slice(&gpos((t * hv) as usize, off + 3.0), &[1, t, hv])
+                .as_dtype(bf).unwrap();
+            (q, k, v, g, beta)
+        };
+        // max|Δ| between a [1,...] row and the b-th row of a [B,...] batch.
+        let row_diff = |single: &Array, batched: &Array, bi: i32| -> f32 {
+            let bslice = batched.index((bi..(bi + 1), 0.., 0.., 0..));
+            let d = single.subtract(&bslice).unwrap().abs().unwrap().max(None).unwrap();
+            eval([&d]).unwrap();
+            d.item::<f32>()
+        };
+        let cat = |a: &Array, b: &Array| mlx_rs::ops::concatenate_axis(&[a, b], 0).unwrap();
+
+        // ── Prefill: two distinct sequences, alone vs stacked B=2. ──
+        let (q0, k0, v0, g0, b0) = row(4, 0.0);
+        let (q1, k1, v1, g1, b1) = row(4, 5.0);
+        let (y0, s0) = gated_delta_kernel(&q0, &k0, &v0, &g0, &b0, None).unwrap();
+        let (y1, s1) = gated_delta_kernel(&q1, &k1, &v1, &g1, &b1, None).unwrap();
+        let (qb, kb, vb, gb, bb) =
+            (cat(&q0, &q1), cat(&k0, &k1), cat(&v0, &v1), cat(&g0, &g1), cat(&b0, &b1));
+        let (yb, sb) = gated_delta_kernel(&qb, &kb, &vb, &gb, &bb, None).unwrap();
+        for (name, single, batched, bi) in [
+            ("y row0", &y0, &yb, 0), ("y row1", &y1, &yb, 1),
+            ("state row0", &s0, &sb, 0), ("state row1", &s1, &sb, 1),
+        ] {
+            let d = row_diff(single, batched, bi);
+            eprintln!("GDN-BATCH prefill {name}: max|Δ|={d:.3e}");
+            assert_eq!(d, 0.0, "{name} must be byte-exact batched vs alone");
+        }
+
+        // ── Decode step: feed each row's carried state, alone vs the batched state. ──
+        let (dq0, dk0, dv0, dg0, db0) = row(1, 7.0);
+        let (dq1, dk1, dv1, dg1, db1) = row(1, 11.0);
+        let (dy0, _) = gated_delta_kernel(&dq0, &dk0, &dv0, &dg0, &db0, Some(s0)).unwrap();
+        let (dy1, _) = gated_delta_kernel(&dq1, &dk1, &dv1, &dg1, &db1, Some(s1)).unwrap();
+        let (dqb, dkb, dvb, dgb, dbb) =
+            (cat(&dq0, &dq1), cat(&dk0, &dk1), cat(&dv0, &dv1), cat(&dg0, &dg1), cat(&db0, &db1));
+        let (dyb, _) = gated_delta_kernel(&dqb, &dkb, &dvb, &dgb, &dbb, Some(sb)).unwrap();
+        for (name, single, bi) in [("decode row0", &dy0, 0), ("decode row1", &dy1, 1)] {
+            let d = row_diff(single, &dyb, bi);
+            eprintln!("GDN-BATCH {name}: max|Δ|={d:.3e}");
+            assert_eq!(d, 0.0, "{name} must be byte-exact batched vs alone");
+        }
+        eprintln!("GDN-BATCH: GatedDeltaNet batches row-independently (byte-exact) ✓");
+    }
 }

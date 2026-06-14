@@ -53,6 +53,34 @@ pub fn prefill_chunk_size() -> i32 {
         .unwrap_or(PREFILL_CHUNK_DEFAULT)
 }
 
+thread_local! {
+    /// Per-row RoPE offsets `[B]` for ragged batched decode of the hybrid full-attention
+    /// layers (the mirror of `qwen3::BATCH_PAD_OFFSETS`). When set, [`Attention::forward`]
+    /// ropes q/k at `cache.offset() − pad_i` per row instead of one shared offset, so a
+    /// left-padded batch of different-length sequences gets each row's true positions.
+    /// OFF by default → the B=1 path is byte-identical. The GatedDeltaNet layers need NO
+    /// such treatment (fixed-size per-row state, see `gated_delta_batches_row_independent`).
+    static BATCH_PAD_OFFSETS: std::cell::RefCell<Option<Array>> =
+        const { std::cell::RefCell::new(None) };
+    /// Per-row additive key-pad mask `[B,1,1,kv_len]` for the same ragged batched decode:
+    /// masks each row's left-pad key slots `[0, pad_i)` out of the full-attention SDPA,
+    /// replacing the fused `Causal` mask. Set together with [`BATCH_PAD_OFFSETS`].
+    static BATCH_PAD_MASK: std::cell::RefCell<Option<Array>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set (or clear with `None`) the per-row RoPE offsets used by the hybrid full-attention
+/// layers during ragged batched decode. Set before a batched forward; clear it after.
+pub fn set_batch_pad_offsets(offsets: Option<Array>) {
+    BATCH_PAD_OFFSETS.with(|c| *c.borrow_mut() = offsets);
+}
+
+/// Set (or clear with `None`) the per-row key-pad mask used by the hybrid full-attention
+/// layers during ragged batched decode. Set before a batched forward; clear it after.
+pub fn set_batch_pad_mask(mask: Option<Array>) {
+    BATCH_PAD_MASK.with(|c| *c.borrow_mut() = mask);
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -250,14 +278,30 @@ impl Attention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let (keys, values) = if let Some(cache) = cache {
-            let qin = nn::RopeInputBuilder::new(&queries)
-                .offset(cache.offset())
-                .build()?;
-            queries = self.rope.forward(qin)?;
-            let kin = nn::RopeInputBuilder::new(&keys)
-                .offset(cache.offset())
-                .build()?;
-            keys = self.rope.forward(kin)?;
+            // Ragged batched decode: rope each row at `cache.offset() − pad_i` (its true
+            // position) via the per-row offsets; else the normal shared scalar offset.
+            let per_row = BATCH_PAD_OFFSETS.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .map(|pad| Array::from_int(cache.offset()).subtract(pad))
+            });
+            match per_row {
+                Some(offsets) => {
+                    let offsets = offsets?;
+                    queries = self.rope.forward_dynamic(&queries, &offsets)?;
+                    keys = self.rope.forward_dynamic(&keys, &offsets)?;
+                }
+                None => {
+                    let qin = nn::RopeInputBuilder::new(&queries)
+                        .offset(cache.offset())
+                        .build()?;
+                    queries = self.rope.forward(qin)?;
+                    let kin = nn::RopeInputBuilder::new(&keys)
+                        .offset(cache.offset())
+                        .build()?;
+                    keys = self.rope.forward(kin)?;
+                }
+            }
             cache.update_and_fetch(keys, values)?
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
@@ -267,8 +311,14 @@ impl Attention {
 
         // Fused causal SDPA: MLX's built-in causal mode skips the masked upper
         // triangle and avoids an explicit `[L, ctx]` mask array (queries align to
-        // the last `L` of the cached keys). Decode (L==1) needs no mask.
-        let mask = causal.then_some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal);
+        // the last `L` of the cached keys). Decode (L==1) needs no mask. For ragged
+        // batched decode an explicit per-row key-pad mask replaces `Causal` (masking
+        // each row's left-pad key slots out of the batched KV).
+        let pad_mask = BATCH_PAD_MASK.with(|c| c.borrow().clone());
+        let mask = match &pad_mask {
+            Some(m) => Some(mlx_rs::fast::ScaledDotProductAttentionMask::Array(m)),
+            None => causal.then_some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal),
+        };
         let attn =
             mlx_rs::fast::scaled_dot_product_attention(queries, keys, values, self.scale, mask, None)?;
         let out = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
