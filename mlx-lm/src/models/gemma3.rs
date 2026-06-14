@@ -397,12 +397,28 @@ pub struct Model {
     #[quantizable]
     #[param]
     pub model: Gemma3Model,
+    /// Gemma ties embeddings, but mlx-community 4-bit conversions materialize a SEPARATE
+    /// quantized `lm_head` (its quant params differ from the embedding's), so when the
+    /// checkpoint ships one we must use it — the tied `embed_tokens.as_linear` would give
+    /// wrong logits. `None` = truly tied (use the embedding).
+    #[quantizable]
+    #[param]
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Model {
-    pub fn new(args: ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: ModelArgs, has_lm_head: bool) -> Result<Self, Exception> {
         let model = Gemma3Model::new(&args)?;
-        Ok(Self { args, model })
+        let lm_head = if has_lm_head {
+            Some(MaybeQuantized::Original(
+                nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
+                    .bias(false)
+                    .build()?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self { args, model, lm_head })
     }
 
     pub fn model_type(&self) -> &str {
@@ -419,15 +435,21 @@ where
 
     fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
         let out = self.model.forward(input)?;
-        // Tied embeddings: lm_head is the embedding read as a linear.
-        match &mut self.model.embed_tokens {
-            MaybeQuantized::Original(e) => e.as_linear(&out),
-            MaybeQuantized::Quantized(q) => q.as_linear(&out),
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&out),
+            // Truly tied: lm_head is the embedding read as a linear.
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(e) => e.as_linear(&out),
+                MaybeQuantized::Quantized(q) => q.as_linear(&out),
+            },
         }
     }
 
     fn training_mode(&mut self, mode: bool) {
         <Gemma3Model as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
+        if let Some(lm_head) = &mut self.lm_head {
+            lm_head.training_mode(mode);
+        }
     }
 }
 
@@ -438,47 +460,56 @@ struct WeightMap {
 
 pub fn load_gemma3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let args: ModelArgs = serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let args: ModelArgs =
+        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let quantization = args.quantization.clone();
-    let mut model = Model::new(args)?;
+
+    // Gather every weight tensor up front (so we can detect a materialized `lm_head`).
+    let mut loaded: std::collections::HashMap<String, Array> = std::collections::HashMap::new();
+    let index = model_dir.join("model.safetensors.index.json");
+    let files: Vec<std::path::PathBuf> = if index.exists() {
+        let wm: WeightMap = serde_json::from_str(&std::fs::read_to_string(index)?)?;
+        wm.weight_map
+            .values()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|f| model_dir.join(f))
+            .collect()
+    } else {
+        vec![model_dir.join("model.safetensors")]
+    };
+    for f in files {
+        for (k, v) in mlx_rs::Array::load_safetensors(&f)? {
+            loaded.insert(k, v);
+        }
+    }
+
+    let has_lm_head = loaded.keys().any(|k| k.starts_with("lm_head."));
+    let mut model = Model::new(args, has_lm_head)?;
     if let Some(q) = quantization {
         model = mlx_rs::nn::quantize(model, q.group_size, q.bits)?;
     }
 
-    fn load_remapped(model: &mut Model, file: &Path) -> Result<usize, Error> {
-        let loaded = mlx_rs::Array::load_safetensors(file)?;
-        let has_scales: HashSet<String> = loaded
-            .keys()
-            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
-            .collect();
-        let mut params = model.parameters_mut().flatten();
-        let mut matched = 0usize;
-        for (key, value) in loaded {
-            let mapped = match key.strip_suffix(".weight") {
-                Some(prefix) if has_scales.contains(prefix) => format!("{prefix}.inner.weight"),
-                _ => key,
-            };
-            if let Some(param) = params.get_mut(mapped.as_str()) {
-                **param = value;
-                matched += 1;
-            }
-        }
-        Ok(matched)
-    }
-
-    let index = model_dir.join("model.safetensors.index.json");
+    let has_scales: HashSet<String> = loaded
+        .keys()
+        .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+        .collect();
+    let mut params = model.parameters_mut().flatten();
     let mut matched = 0usize;
-    if index.exists() {
-        let wm: WeightMap = serde_json::from_str(&std::fs::read_to_string(index)?)?;
-        for f in wm.weight_map.values().collect::<HashSet<_>>() {
-            matched += load_remapped(&mut model, &model_dir.join(f))?;
+    for (key, value) in loaded {
+        let mapped = match key.strip_suffix(".weight") {
+            Some(prefix) if has_scales.contains(prefix) => format!("{prefix}.inner.weight"),
+            _ => key,
+        };
+        if let Some(param) = params.get_mut(mapped.as_str()) {
+            **param = value;
+            matched += 1;
         }
-    } else {
-        matched = load_remapped(&mut model, &model_dir.join("model.safetensors"))?;
     }
     if std::env::var("ROZUM_MLX_DEBUG").is_ok() {
-        eprintln!("LOADED {matched} params (gemma3)");
+        eprintln!("LOADED {matched} params (gemma3, lm_head={has_lm_head})");
     }
+    drop(params);
     model.eval()?;
     Ok(model)
 }
