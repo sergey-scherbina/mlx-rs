@@ -248,14 +248,24 @@ where
 }
 
 pub fn load_model_chat_template_from_str(content: &str) -> std::io::Result<Option<String>> {
-    serde_json::from_str::<serde_json::Value>(content)
-        .map(|value| {
-            value
-                .get("chat_template")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        })
-        .map_err(Into::into)
+    let value: serde_json::Value = serde_json::from_str(content)?;
+    let Some(ct) = value.get("chat_template") else {
+        return Ok(None);
+    };
+    // `chat_template` is either a plain Jinja string, or the older list-of-`{name, template}`
+    // form (Mistral / Mistral-Nemo and some others ship multiple named templates). For the
+    // list form pick the entry named "default" (the plain-chat template), else the first.
+    let template = match ct {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("default"))
+            .or_else(|| entries.first())
+            .and_then(|e| e.get("template").and_then(|t| t.as_str()))
+            .map(ToString::to_string),
+        _ => None,
+    };
+    Ok(template)
 }
 
 pub fn load_model_chat_template_from_file(
@@ -551,9 +561,29 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::tokenizer::{
-        apply_chat_template, load_model_chat_template_from_file, ApplyChatTemplateArgs,
-        Conversation, Role,
+        apply_chat_template, load_model_chat_template_from_file,
+        load_model_chat_template_from_str, ApplyChatTemplateArgs, Conversation, Role,
     };
+
+    // `chat_template` parses from both the plain-string form and the older
+    // list-of-`{name, template}` form (Mistral / Mistral-Nemo ship the latter).
+    #[test]
+    fn chat_template_string_and_list_forms() {
+        // String form.
+        let s = r#"{"chat_template": "HELLO {{ x }}"}"#;
+        assert_eq!(load_model_chat_template_from_str(s).unwrap().as_deref(), Some("HELLO {{ x }}"));
+        // List form: pick the "default" entry, not the first.
+        let l = r#"{"chat_template": [
+            {"name": "tool_use", "template": "TOOLS"},
+            {"name": "default", "template": "PLAIN {{ x }}"}
+        ]}"#;
+        assert_eq!(load_model_chat_template_from_str(l).unwrap().as_deref(), Some("PLAIN {{ x }}"));
+        // List with no "default": fall back to the first entry.
+        let f = r#"{"chat_template": [{"name": "x", "template": "FIRST"}]}"#;
+        assert_eq!(load_model_chat_template_from_str(f).unwrap().as_deref(), Some("FIRST"));
+        // Absent → None.
+        assert_eq!(load_model_chat_template_from_str("{}").unwrap(), None);
+    }
 
     /// Returns the path to test fixtures. Uses TEST_MODEL_DIR env var if set,
     /// otherwise falls back to the fixtures bundled in the repo.
@@ -591,6 +621,7 @@ mod tests {
             add_generation_prompt: None,
             continue_final_message: None,
             enable_thinking: None,
+            tools: None,
         };
 
         let mut env = Environment::new();
@@ -628,6 +659,7 @@ mod tests {
             add_generation_prompt: None,
             continue_final_message: None,
             enable_thinking: None,
+            tools: None,
         };
 
         let rendered_chat = tokenizer
@@ -663,6 +695,7 @@ mod tests {
             add_generation_prompt: None,
             continue_final_message: None,
             enable_thinking: None,
+            tools: None,
         };
 
         let encodings = tokenizer
