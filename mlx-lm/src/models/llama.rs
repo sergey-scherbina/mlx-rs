@@ -40,7 +40,10 @@ pub struct ModelArgs {
     pub num_key_value_heads: i32,
     pub max_position_embeddings: i32,
     pub rope_theta: f32,
-    pub head_dim: i32,
+    /// Per-head dim. Llama configs set it explicitly; Mistral / Mistral-Nemo omit it (it's
+    /// `hidden_size / num_attention_heads`), so it's optional with that standard default.
+    #[serde(default)]
+    pub head_dim: Option<i32>,
     #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
     #[serde(default)]
@@ -85,7 +88,9 @@ impl Attention {
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
 
-        let head_dim = args.head_dim;
+        let head_dim = args
+            .head_dim
+            .unwrap_or(args.hidden_size / args.num_attention_heads);
         let scale = (head_dim as f32).sqrt().recip();
 
         let q_proj = nn::LinearBuilder::new(dim, n_heads * head_dim)
