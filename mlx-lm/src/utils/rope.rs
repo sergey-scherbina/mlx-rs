@@ -256,6 +256,37 @@ where
     }
 }
 
+impl RopeVariant {
+    /// Apply RoPE with a PER-ROW position offset (`offsets` is a `[B]` array of start
+    /// positions) instead of one scalar offset — for **ragged batched decode**, where
+    /// each batch row is at a different sequence length so each must be rotated at its
+    /// own position. Mirrors [`Module::forward`] but via `rope_dynamic` (the offset
+    /// broadcasts across the batch). Byte-exact vs the scalar path when all offsets
+    /// are equal.
+    pub fn forward_dynamic(&self, x: &Array, offsets: &Array) -> Result<Array, Exception> {
+        match self {
+            RopeVariant::Default(r) => mlx_rs::fast::rope_dynamic(
+                x,
+                r.dimensions,
+                r.traditional,
+                Some(r.base),
+                r.scale,
+                offsets,
+                None,
+            ),
+            RopeVariant::Llama3(r) => mlx_rs::fast::rope_dynamic(
+                x,
+                r.dimensions,
+                r.traditional,
+                None::<f32>,
+                r.scale,
+                offsets,
+                Some(&r.freqs),
+            ),
+        }
+    }
+}
+
 pub fn initialize_rope(
     dims: i32,
     base: f32, // rope_theta

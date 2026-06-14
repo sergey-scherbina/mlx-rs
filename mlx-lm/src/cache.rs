@@ -116,6 +116,26 @@ impl ConcatKeyValueCache {
             self.offset = len.max(0);
         }
     }
+
+    /// The used `(keys, values)` prefix `[.., .., ..offset, ..]` (length `offset`),
+    /// or `None` if empty. For assembling a batched cache from per-sequence caches.
+    pub fn kv_used(&self) -> Option<(Array, Array, i32)> {
+        match (&self.keys, &self.values) {
+            (Some(k), Some(v)) if self.offset > 0 => Some((
+                k.index((.., .., ..self.offset, ..)),
+                v.index((.., .., ..self.offset, ..)),
+                self.offset,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Build a cache directly from a `[B,H,L,D]` keys/values pair already at `offset`
+    /// positions — for stacking per-sequence caches onto the batch axis (ragged
+    /// batched decode). Subsequent `update_and_fetch` grows + appends past `offset`.
+    pub fn from_kv(keys: Array, values: Array, offset: i32) -> Self {
+        Self { keys: Some(keys), values: Some(values), offset }
+    }
 }
 
 impl KeyValueCache for ConcatKeyValueCache {
