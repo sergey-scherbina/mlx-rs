@@ -103,6 +103,19 @@ impl ConcatKeyValueCache {
             s[s.len() - 2]
         })
     }
+
+    /// Drop the cache back to its first `len` positions, keeping the allocated
+    /// buffers (the kept prefix `[0, len)` is untouched; later writes overwrite
+    /// `[len, ..)`). Enables prefix reuse across requests: when a new prompt
+    /// extends a previous one, truncate to the shared prefix length and prefill
+    /// only the new suffix. A no-op if `len >= offset`. Byte-exact: reads use
+    /// `index((.., .., ..offset, ..))`, and `[0, len)` was written by the same
+    /// prefill the fresh path would run, so reusing it yields identical KV.
+    pub fn truncate(&mut self, len: i32) {
+        if len < self.offset {
+            self.offset = len.max(0);
+        }
+    }
 }
 
 impl KeyValueCache for ConcatKeyValueCache {
