@@ -1,4 +1,5 @@
 pub mod gated_delta;
+pub mod gemma3;
 pub mod llama;
 pub mod qwen2;
 pub mod qwen3;
