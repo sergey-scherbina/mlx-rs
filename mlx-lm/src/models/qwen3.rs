@@ -814,6 +814,64 @@ fn top_p_sample(logits: &Array, top_p: f32) -> Result<Array, Exception> {
     Ok(gathered.index((.., 0)))
 }
 
+/// Per-row batched sampling: sample one token id per row of `[B, vocab]` logits, each row
+/// honoring ITS OWN `temp`/`top_k`/`top_p` (`[B]` arrays). A single unified nucleus path
+/// serves every config, so one batch can mix greedy and sampling requests:
+///   - `temp == 0` → that row's argmax (greedy), via a final per-row `where` override.
+///   - `top_k <= 0` → no top-k cutoff (per-row threshold set to `-inf`).
+///   - `top_p >= 1.0` → full nucleus (`1 - top_p <= 0` keeps every token), i.e. plain
+///     temperature-categorical.
+/// Mirrors the scalar [`sample_with`] math (temp → top-k → top-p → categorical) but with
+/// per-row `[B,1]` thresholds. The repetition penalty + explicit seeds are NOT handled here
+/// (those rows stay on the serial path); this is the argmax-or-sample core for batched decode.
+pub fn sample_rows(
+    logits: &Array, // [B, vocab]
+    temp: &Array,   // [B] f32
+    top_k: &Array,  // [B] i32
+    top_p: &Array,  // [B] f32
+) -> Result<Array, Exception> {
+    use mlx_rs::ops::indexing::take_along_axis;
+    let shape = logits.shape();
+    let (b, vocab) = (shape[0], *shape.last().expect("logits rank >= 1"));
+    let temp_c = temp.reshape(&[b, 1])?;
+    let top_k_c = top_k.reshape(&[b, 1])?;
+    let top_p_c = top_p.reshape(&[b, 1])?;
+    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+    let zero_f = Array::from_f32(0.0);
+
+    // Per-row greedy result (used where temp == 0).
+    let greedy = argmax_axis!(logits, -1)?; // [B]
+
+    // Temperature scale (guard temp == 0 against div-by-zero; those rows are overridden).
+    let safe_temp = mlx_rs::ops::r#where(&temp_c.eq(&zero_f)?, &array!(1.0), &temp_c)?;
+    let mut scaled = logits.divide(&safe_temp)?; // [B, vocab]
+
+    // top-k: per-row threshold = the k-th largest logit (sorted ascending → index vocab-k).
+    // `top_k <= 0` rows get a `-inf` threshold (keep all).
+    let sorted = mlx_rs::ops::sort_axis(&scaled, -1)?; // ascending
+    let kpos = array!(vocab).subtract(&top_k_c)?; // [B,1] = vocab - k
+    let kpos = mlx_rs::ops::maximum(&kpos, &array!(0))?;
+    let kpos = mlx_rs::ops::minimum(&kpos, &array!(vocab - 1))?;
+    let kth = take_along_axis(&sorted, &kpos, -1)?; // [B,1]
+    let kth_eff = mlx_rs::ops::r#where(&top_k_c.gt(&array!(0))?, &kth, &neg_inf)?;
+    scaled = mlx_rs::ops::r#where(&scaled.ge(&kth_eff)?, &scaled, &neg_inf)?;
+
+    // top-p nucleus in sorted-prob space (per-row threshold 1 - top_p; >= 1 keeps all).
+    let probs = mlx_rs::ops::softmax_axis(&scaled, -1, true)?;
+    let order = mlx_rs::ops::argsort_axis(&probs, -1)?; // ascending by prob
+    let sorted_probs = take_along_axis(&probs, &order, -1)?;
+    let cum = mlx_rs::ops::cumsum(&sorted_probs, -1, false, true)?; // inclusive
+    let thresh = array!(1.0).subtract(&top_p_c)?; // [B,1]
+    let kept = mlx_rs::ops::r#where(&cum.gt(&thresh)?, &sorted_probs, &zero_f)?;
+    let logp = kept.add(array!(1e-9))?.log()?;
+    let sorted_tok = categorical!(&logp)?; // [B] index into the sorted axis
+    let sampled = take_along_axis(&order, &sorted_tok.index((.., NewAxis)), -1)? // [B,1]
+        .index((.., 0)); // [B]
+
+    // Greedy override per row (temp == 0).
+    mlx_rs::ops::r#where(&temp.eq(&zero_f)?, &greedy, &sampled)
+}
+
 /// How many most-recent tokens the repetition penalty considers.
 pub const REPEAT_CONTEXT: usize = 256;
 
@@ -1009,6 +1067,53 @@ mod tests {
         .unwrap();
         eval([&t]).unwrap();
         assert_eq!(t.index(0).item::<u32>(), 5, "repeat_penalty pushes argmax off 3");
+    }
+
+    // Per-row batched sampler: each row honors its OWN temp/top_k/top_p, and one batch can
+    // MIX greedy + sampling. Deterministic anchors — every row's config collapses to that
+    // row's argmax (temp=0 greedy override / top_k=1 / tiny top_p), with a dominant logit so
+    // the 1e-9 nucleus floor can't flip it. Proves per-row thresholds + the greedy override
+    // pick the right token per row independently.
+    #[test]
+    fn sample_rows_per_row_collapses_to_argmax() {
+        use super::sample_rows;
+        // Three rows with DISTINCT dominant argmax: row0→2, row1→0, row2→5 (logit 9.0).
+        let logits = Array::from_slice(
+            &[
+                0.1f32, 0.2, 9.0, 0.3, 0.4, 0.5, // row0 argmax = 2
+                9.0, 0.1, 0.2, 0.3, 0.4, 0.5, // row1 argmax = 0
+                0.1, 0.2, 0.3, 0.4, 0.5, 9.0, // row2 argmax = 5
+            ],
+            &[3, 6],
+        );
+        let want = [2u32, 0, 5];
+        // Mixed per-row config that each collapses to argmax:
+        //   row0: temp 0   (greedy override)
+        //   row1: top_k 1  at temp 2 (only the max survives)
+        //   row2: tiny top_p at temp 1 (nucleus = just the top token)
+        let temp = Array::from_slice(&[0.0f32, 2.0, 1.0], &[3]);
+        let top_k = Array::from_slice(&[0i32, 1, 0], &[3]);
+        let top_p = Array::from_slice(&[1.0f32, 1.0, 1e-4], &[3]);
+        let t = sample_rows(&logits, &temp, &top_k, &top_p).unwrap();
+        eval([&t]).unwrap();
+        for r in 0..3 {
+            assert_eq!(
+                t.index(r as i32).item::<u32>(),
+                want[r],
+                "row {r} must collapse to its own argmax"
+            );
+        }
+
+        // All-greedy batch (temp 0 everywhere) must equal per-row argmax exactly — this is
+        // the path the previously greedy-only batched decode relied on, now via sample_rows.
+        let temp0 = Array::from_slice(&[0.0f32, 0.0, 0.0], &[3]);
+        let tk0 = Array::from_slice(&[0i32, 0, 0], &[3]);
+        let tp1 = Array::from_slice(&[1.0f32, 1.0, 1.0], &[3]);
+        let g = sample_rows(&logits, &temp0, &tk0, &tp1).unwrap();
+        eval([&g]).unwrap();
+        for r in 0..3 {
+            assert_eq!(g.index(r as i32).item::<u32>(), want[r], "greedy row {r}");
+        }
     }
 
     #[test]
