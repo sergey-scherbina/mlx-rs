@@ -589,8 +589,10 @@ pub struct Generate<'a> {
     state: GenState<'a>,
     /// Polled between prefill chunks for mid-prefill cancellation (see qwen3_5).
     should_cancel: Box<dyn Fn() -> bool + Send>,
-    /// Linear-state snapshot at end of prefill, for prefix reuse (see qwen3_5).
+    /// Linear-state snapshot at the conversation boundary, for prefix reuse (qwen3_5).
     prefill_snapshot: Option<Vec<LinearSnap>>,
+    /// Trailing generation-prompt length; the snapshot is taken before it (qwen3_5).
+    gen_prompt_len: i32,
 }
 
 enum GenState<'a> {
@@ -620,10 +622,16 @@ impl<'a> Generate<'a> {
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
             prefill_snapshot: None,
+            gen_prompt_len: 0,
         }
     }
 
-    /// Consume the iterator, returning the advanced cache + the end-of-prefill
+    /// Set the trailing generation-prompt length (snapshot at the conv boundary).
+    pub fn set_gen_prompt_len(&mut self, n: i32) {
+        self.gen_prompt_len = n.max(0);
+    }
+
+    /// Consume the iterator, returning the advanced cache + the conversation-boundary
     /// Linear snapshot (`None` if prefill never completed). See qwen3_5.
     pub fn into_cache_and_snapshot(self) -> (Vec<LayerCache>, Option<Vec<LinearSnap>>) {
         (self.cache, self.prefill_snapshot)
@@ -659,18 +667,43 @@ impl Iterator for Generate<'_> {
             GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
         let logits = if is_prefill {
-            let l = match tri!(self.model.prefill_cancellable(
-                &inputs,
-                &mut self.cache,
-                crate::models::qwen3_5::prefill_chunk_size(),
-                &*self.should_cancel,
-            )) {
-                Some(l) => l,
-                None => return None,
-            };
-            // Snapshot the recurrent Linear state at end of prefill (see qwen3_5).
-            self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
-            l
+            // Snapshot the Linear state at the conversation boundary (prompt len −
+            // gen_prompt_len), not the very end — see qwen3_5 for the rationale.
+            let chunk = crate::models::qwen3_5::prefill_chunk_size();
+            let t = inputs.shape()[1];
+            let split = t - self.gen_prompt_len;
+            if self.gen_prompt_len > 0 && split >= 0 && split < t {
+                if split > 0 {
+                    let conv = inputs.index((.., 0..split));
+                    if tri!(self.model.prefill_cancellable(
+                        &conv,
+                        &mut self.cache,
+                        chunk,
+                        &*self.should_cancel,
+                    ))
+                    .is_none()
+                    {
+                        return None;
+                    }
+                }
+                self.prefill_snapshot =
+                    Some(self.cache.iter().map(|c| c.snapshot()).collect());
+                let tail = inputs.index((.., split..t));
+                tri!(self.model.forward(&tail, &mut self.cache))
+            } else {
+                let l = match tri!(self.model.prefill_cancellable(
+                    &inputs,
+                    &mut self.cache,
+                    chunk,
+                    &*self.should_cancel,
+                )) {
+                    Some(l) => l,
+                    None => return None,
+                };
+                self.prefill_snapshot =
+                    Some(self.cache.iter().map(|c| c.snapshot()).collect());
+                l
+            }
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };

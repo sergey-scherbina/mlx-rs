@@ -996,11 +996,16 @@ pub struct Generate<'a> {
     /// is honored mid-prefill (a long prompt can take seconds), not only between
     /// decode tokens. Default never cancels; the host wires it via `set_cancel`.
     should_cancel: Box<dyn Fn() -> bool + Send>,
-    /// Linear (GatedDeltaNet) state snapshot taken at the END of prefill (offset ==
-    /// prompt len), for cross-request prefix reuse. Filled on the first (prefill)
-    /// `next()`; `None` if prefill was cancelled. The host persists it alongside the
-    /// (advanced) cache to restore the recurrent state next turn.
+    /// Linear (GatedDeltaNet) state snapshot taken at the CONVERSATION boundary
+    /// during prefill (offset == prompt len − `gen_prompt_len`), for cross-request
+    /// prefix reuse. Filled on the first (prefill) `next()`; `None` if prefill was
+    /// cancelled. The host persists it alongside the (advanced) cache.
     prefill_snapshot: Option<Vec<LinearSnap>>,
+    /// Number of trailing prompt tokens that are the generation prompt (the part that
+    /// does NOT recur next turn). The prefill snapshots the Linear state BEFORE these
+    /// tokens, so the snapshot offset matches the reuse boundary. 0 → snapshot at the
+    /// very end (the whole prompt recurs).
+    gen_prompt_len: i32,
 }
 
 enum GenState<'a> {
@@ -1032,13 +1037,20 @@ impl<'a> Generate<'a> {
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
             prefill_snapshot: None,
+            gen_prompt_len: 0,
         }
     }
 
+    /// Set the trailing generation-prompt length so the prefill snapshots the Linear
+    /// state at the conversation boundary (offset == prompt len − `gen_prompt_len`).
+    pub fn set_gen_prompt_len(&mut self, n: i32) {
+        self.gen_prompt_len = n.max(0);
+    }
+
     /// Consume the iterator, returning the (now advanced) cache + the Linear-state
-    /// snapshot taken at end-of-prefill (`None` if prefill never completed). For
-    /// prefix reuse next turn: truncate the `Full` layers + restore `Linear` from
-    /// the snapshot.
+    /// snapshot taken at the conversation boundary (`None` if prefill never
+    /// completed). For prefix reuse next turn: truncate the `Full` layers + restore
+    /// `Linear` from the snapshot.
     pub fn into_cache_and_snapshot(self) -> (Vec<LayerCache>, Option<Vec<LinearSnap>>) {
         (self.cache, self.prefill_snapshot)
     }
@@ -1078,24 +1090,53 @@ impl Iterator for Generate<'_> {
         // last position only; decode (T=1) is a plain forward. Prefill is
         // cancellable between chunks -> None ends the iteration on a mid-prefill
         // cancel.
+        //
+        // For prefix reuse we snapshot the recurrent `Linear` state at the
+        // CONVERSATION boundary (prompt len − `gen_prompt_len`), not at the very end:
+        // the trailing generation prompt doesn't recur next turn. So prefill the
+        // conversation part, snapshot, then prefill the (tiny) generation-prompt tail.
         let logits = if is_prefill {
-            match tri!(self.model.prefill_cancellable(
-                &inputs,
-                &mut self.cache,
-                prefill_chunk_size(),
-                &*self.should_cancel,
-            )) {
-                Some(l) => l,
-                None => return None,
+            let t = inputs.shape()[1];
+            let split = t - self.gen_prompt_len;
+            if self.gen_prompt_len > 0 && split >= 0 && split < t {
+                // conversation part -> advances to the boundary (may be empty when the
+                // whole conversation was already reused and only the gen prompt is new)
+                if split > 0 {
+                    let conv = inputs.index((.., 0..split));
+                    if tri!(self.model.prefill_cancellable(
+                        &conv,
+                        &mut self.cache,
+                        prefill_chunk_size(),
+                        &*self.should_cancel,
+                    ))
+                    .is_none()
+                    {
+                        return None;
+                    }
+                }
+                self.prefill_snapshot =
+                    Some(self.cache.iter().map(|c| c.snapshot()).collect());
+                // generation-prompt tail -> the logits to sample the first token from
+                let tail = inputs.index((.., split..t));
+                tri!(self.model.forward(&tail, &mut self.cache))
+            } else {
+                // No split (no/again whole-prompt gen): snapshot at the very end.
+                let l = match tri!(self.model.prefill_cancellable(
+                    &inputs,
+                    &mut self.cache,
+                    prefill_chunk_size(),
+                    &*self.should_cancel,
+                )) {
+                    Some(l) => l,
+                    None => return None,
+                };
+                self.prefill_snapshot =
+                    Some(self.cache.iter().map(|c| c.snapshot()).collect());
+                l
             }
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
-        // At end of prefill (offset == prompt len, no decode token in the cache yet)
-        // snapshot the recurrent `Linear` state for cross-request prefix reuse.
-        if is_prefill {
-            self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
-        }
         let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
             crate::models::qwen3::repeat_window(&self.history)
         } else {
