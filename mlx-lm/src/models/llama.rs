@@ -576,6 +576,100 @@ pub fn load_llama_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     Ok(model)
 }
 
+/// Split `key` of the form `<prefix>.<name>.<suffix>` into `(prefix, suffix)`, or `None`.
+fn split_fused_key<'a>(key: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+    let needle = format!(".{name}.");
+    let idx = key.find(&needle)?;
+    Some((&key[..idx], &key[idx + needle.len()..]))
+}
+
+/// Phi-3 (`model_type: "phi3"`) loads into the Llama [`Model`]: it IS the Llama architecture
+/// (RMSNorm, RoPE, SwiGLU, GQA, no qkv-bias) but ships FUSED projections — one `qkv_proj` and
+/// one `gate_up_proj` per layer instead of separate `q/k/v_proj` + `gate/up_proj`. We split each
+/// fused tensor along the OUTPUT axis into the separate weights the Llama structure expects, then
+/// load as usual. The 4-bit AFQ packing is along the INPUT axis, so row-slicing the
+/// weight/scales/biases is exact — no unpacking. Reuses every Llama block, the forward, and
+/// `Generate`, so Phi-3 needs no new model file or runtime path. (Phi-3-mini-4k: full RoPE, no
+/// `rope_scaling`; the 128k `su`/longrope variant would need the scaling threaded — separate.)
+pub fn load_phi3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = get_llama_model_args(model_dir)?;
+    let quantization = args.quantization.clone();
+    let head_dim = args
+        .head_dim
+        .unwrap_or(args.hidden_size / args.num_attention_heads);
+    let q_out = args.num_attention_heads * head_dim;
+    let kv_out = args.num_key_value_heads * head_dim;
+    let inter = args.intermediate_size;
+    let mut model = Model::new(args)?;
+    if let Some(q) = quantization {
+        model = mlx_rs::nn::quantize(model, q.group_size, q.bits)?;
+    }
+
+    // Gather every weight tensor (sharded or single-file).
+    let mut loaded: HashMap<String, Array> = HashMap::new();
+    let index = model_dir.join("model.safetensors.index.json");
+    let files: Vec<std::path::PathBuf> = if index.exists() {
+        let json = std::fs::read_to_string(&index)?;
+        let wm: WeightMap = serde_json::from_str(&json)?;
+        wm.weight_map
+            .values()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|f| model_dir.join(f))
+            .collect()
+    } else {
+        vec![model_dir.join("model.safetensors")]
+    };
+    for f in files {
+        for (k, v) in mlx_rs::Array::load_safetensors(&f)? {
+            loaded.insert(k, v);
+        }
+    }
+
+    // Split the fused projections (q/k/v stacked on the output axis; gate/up stacked).
+    let row = |a: &Array, s: i32, e: i32| a.index((s..e, ..));
+    let mut split: HashMap<String, Array> = HashMap::new();
+    for (k, v) in loaded {
+        if let Some((pre, suf)) = split_fused_key(&k, "qkv_proj") {
+            split.insert(format!("{pre}.q_proj.{suf}"), row(&v, 0, q_out));
+            split.insert(format!("{pre}.k_proj.{suf}"), row(&v, q_out, q_out + kv_out));
+            split.insert(
+                format!("{pre}.v_proj.{suf}"),
+                row(&v, q_out + kv_out, q_out + 2 * kv_out),
+            );
+        } else if let Some((pre, suf)) = split_fused_key(&k, "gate_up_proj") {
+            split.insert(format!("{pre}.gate_proj.{suf}"), row(&v, 0, inter));
+            split.insert(format!("{pre}.up_proj.{suf}"), row(&v, inter, 2 * inter));
+        } else {
+            split.insert(k, v);
+        }
+    }
+
+    // Remap quantized `<prefix>.weight` -> `<prefix>.inner.weight` (scales sibling), then load.
+    let has_scales: HashSet<String> = split
+        .keys()
+        .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+        .collect();
+    let mut params = model.parameters_mut().flatten();
+    let mut matched = 0usize;
+    for (key, value) in split {
+        let mapped = match key.strip_suffix(".weight") {
+            Some(prefix) if has_scales.contains(prefix) => format!("{prefix}.inner.weight"),
+            _ => key,
+        };
+        if let Some(param) = params.get_mut(mapped.as_str()) {
+            **param = value;
+            matched += 1;
+        }
+    }
+    if std::env::var("ROZUM_MLX_DEBUG").is_ok() {
+        eprintln!("LOADED {matched} params (phi3, fused-split)");
+    }
+    model.eval()?;
+    Ok(model)
+}
+
 pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
     match temp {
         0.0 => argmax_axis!(logits, -1),
