@@ -245,6 +245,12 @@ where
     /// default); `Some(false)` makes a thinking model emit a closed empty
     /// `<think></think>` in the PROMPT so its output is clean.
     pub enable_thinking: Option<bool>,
+    /// Special-token strings exposed to the template as `bos_token` / `eos_token`. Some
+    /// templates (Gemma's `{{ bos_token }}`) emit the BOS via the template rather than at
+    /// encode time; without these the BOS is silently dropped and a BOS-sensitive model
+    /// (Gemma) produces garbage. `None` renders an empty string for that variable.
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
 }
 
 pub fn load_model_chat_template_from_str(content: &str) -> std::io::Result<Option<String>> {
@@ -464,6 +470,8 @@ where
         add_generation_prompt,
         continue_final_message,
         enable_thinking,
+        bos_token,
+        eos_token,
     } = args;
 
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
@@ -491,10 +499,13 @@ where
         Some(add_generation_prompt),
         Some(continue_final_message),
         enable_thinking,
+        bos_token,
+        eos_token,
     )
 }
 
 // TODO: render with assistant indices
+#[allow(clippy::too_many_arguments)]
 fn render_jinja_tempalte<'a, R, T>(
     template: Template,
     conversations: impl IntoIterator<Item = Chat<'a, R, T>>,
@@ -503,6 +514,8 @@ fn render_jinja_tempalte<'a, R, T>(
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
     enable_thinking: Option<bool>,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
 ) -> Result<Vec<String>, Error>
 where
     R: Serialize + 'a,
@@ -524,6 +537,8 @@ where
             documents => documents,
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking,
+            bos_token => bos_token,
+            eos_token => eos_token,
         })?;
 
         if continue_final_message {
@@ -622,6 +637,8 @@ mod tests {
             continue_final_message: None,
             enable_thinking: None,
             tools: None,
+            bos_token: None,
+            eos_token: None,
         };
 
         let mut env = Environment::new();
@@ -660,6 +677,8 @@ mod tests {
             continue_final_message: None,
             enable_thinking: None,
             tools: None,
+            bos_token: None,
+            eos_token: None,
         };
 
         let rendered_chat = tokenizer
@@ -696,6 +715,8 @@ mod tests {
             continue_final_message: None,
             enable_thinking: None,
             tools: None,
+            bos_token: None,
+            eos_token: None,
         };
 
         let encodings = tokenizer
