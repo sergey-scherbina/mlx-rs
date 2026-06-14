@@ -507,6 +507,61 @@ impl LayerCache {
             }
         }
     }
+
+    /// Drop a `Full` (KV) layer back to its first `len` positions for prefix reuse;
+    /// `Linear` is a no-op here — its recurrent state can't be truncated, so it is
+    /// restored from a [`LinearSnap`] snapshot instead (see [`Self::snapshot`]).
+    pub fn truncate(&mut self, len: i32) {
+        if let LayerCache::Full(kv) = self {
+            kv.truncate(len);
+        }
+    }
+
+    /// Deep-copy this layer's recurrent (`Linear`) state into an independent buffer
+    /// for a prefix snapshot, taken at the end of prefill (offset == prompt len).
+    /// `deep_clone` forces materialization + a fresh buffer, so the snapshot survives
+    /// any buffer donation by the subsequent decode steps. `Full` needs no snapshot
+    /// (its KV buffer is kept live and truncated).
+    pub fn snapshot(&self) -> LinearSnap {
+        match self {
+            LayerCache::Full(_) => LinearSnap::Full,
+            LayerCache::Linear { conv, state } => LinearSnap::Linear {
+                conv: conv.as_ref().map(|a| {
+                    let _ = a.eval();
+                    a.deep_clone()
+                }),
+                state: state.as_ref().map(|a| {
+                    let _ = a.eval();
+                    a.deep_clone()
+                }),
+            },
+        }
+    }
+
+    /// Restore a `Linear` layer's recurrent state from a snapshot (deep-cloned again
+    /// so the persisted snapshot stays pristine for the next reuse). `Full` is a
+    /// no-op (handled by [`Self::truncate`]).
+    pub fn restore(&mut self, snap: &LinearSnap) {
+        if let (
+            LayerCache::Linear { conv, state },
+            LinearSnap::Linear { conv: sc, state: ss },
+        ) = (self, snap)
+        {
+            *conv = sc.as_ref().map(|a| a.deep_clone());
+            *state = ss.as_ref().map(|a| a.deep_clone());
+        }
+    }
+}
+
+/// A deep-copied snapshot of a layer's recurrent (`Linear`) state at the end of
+/// prefill, for cross-request prefix reuse. `Full` (KV) layers carry no snapshot —
+/// their KV buffer is kept live and truncated to the shared prefix; `Linear` layers
+/// can't be truncated (the GatedDeltaNet state is a running summary), so their small
+/// conv + recurrent state is deep-copied and restored on the next reuse.
+#[derive(Clone)]
+pub enum LinearSnap {
+    Full,
+    Linear { conv: Option<Array>, state: Option<Array> },
 }
 
 // ─── Decoder layer / model ───────────────────────────────────────────────────
@@ -941,6 +996,11 @@ pub struct Generate<'a> {
     /// is honored mid-prefill (a long prompt can take seconds), not only between
     /// decode tokens. Default never cancels; the host wires it via `set_cancel`.
     should_cancel: Box<dyn Fn() -> bool + Send>,
+    /// Linear (GatedDeltaNet) state snapshot taken at the END of prefill (offset ==
+    /// prompt len), for cross-request prefix reuse. Filled on the first (prefill)
+    /// `next()`; `None` if prefill was cancelled. The host persists it alongside the
+    /// (advanced) cache to restore the recurrent state next turn.
+    prefill_snapshot: Option<Vec<LinearSnap>>,
 }
 
 enum GenState<'a> {
@@ -951,6 +1011,19 @@ enum GenState<'a> {
 impl<'a> Generate<'a> {
     pub fn new(model: &'a mut Model, temp: f32, prompt_token: &'a Array) -> Self {
         let cache = model.init_cache();
+        Self::with_cache(model, temp, prompt_token, cache)
+    }
+
+    /// Start generation from a pre-populated cache (prefix reuse): prefill only
+    /// `prompt_token` (the new suffix) on top of `cache` instead of from scratch.
+    /// The host has already truncated the `Full` layers to the shared prefix and
+    /// restored the `Linear` layers from a snapshot (see [`LayerCache`]).
+    pub fn with_cache(
+        model: &'a mut Model,
+        temp: f32,
+        prompt_token: &'a Array,
+        cache: Vec<LayerCache>,
+    ) -> Self {
         Self {
             model,
             cache,
@@ -958,7 +1031,16 @@ impl<'a> Generate<'a> {
             history: Vec::new(),
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
+            prefill_snapshot: None,
         }
+    }
+
+    /// Consume the iterator, returning the (now advanced) cache + the Linear-state
+    /// snapshot taken at end-of-prefill (`None` if prefill never completed). For
+    /// prefix reuse next turn: truncate the `Full` layers + restore `Linear` from
+    /// the snapshot.
+    pub fn into_cache_and_snapshot(self) -> (Vec<LayerCache>, Option<Vec<LinearSnap>>) {
+        (self.cache, self.prefill_snapshot)
     }
 
     /// Install a cancellation predicate, polled between prefill chunks. When it
@@ -1009,6 +1091,11 @@ impl Iterator for Generate<'_> {
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
+        // At end of prefill (offset == prompt len, no decode token in the cache yet)
+        // snapshot the recurrent `Linear` state for cross-request prefix reuse.
+        if is_prefill {
+            self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
+        }
         let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
             crate::models::qwen3::repeat_window(&self.history)
         } else {

@@ -35,7 +35,7 @@ use crate::{
     error::Error,
     models::{
         qwen3::{Mlp, QuantizationConfig},
-        qwen3_5::{Attention, GatedDeltaNet, LayerCache, ModelArgs as Qwen35Args},
+        qwen3_5::{Attention, GatedDeltaNet, LayerCache, LinearSnap, ModelArgs as Qwen35Args},
         qwen3_moe::SwitchGlu,
     },
     utils::rope::FloatOrString,
@@ -589,6 +589,8 @@ pub struct Generate<'a> {
     state: GenState<'a>,
     /// Polled between prefill chunks for mid-prefill cancellation (see qwen3_5).
     should_cancel: Box<dyn Fn() -> bool + Send>,
+    /// Linear-state snapshot at end of prefill, for prefix reuse (see qwen3_5).
+    prefill_snapshot: Option<Vec<LinearSnap>>,
 }
 
 enum GenState<'a> {
@@ -599,6 +601,17 @@ enum GenState<'a> {
 impl<'a> Generate<'a> {
     pub fn new(model: &'a mut Model, temp: f32, prompt_token: &'a Array) -> Self {
         let cache = model.init_cache();
+        Self::with_cache(model, temp, prompt_token, cache)
+    }
+
+    /// Start generation from a pre-populated cache (prefix reuse): prefill only
+    /// `prompt_token` (the new suffix) on top of `cache`. See qwen3_5.
+    pub fn with_cache(
+        model: &'a mut Model,
+        temp: f32,
+        prompt_token: &'a Array,
+        cache: Vec<LayerCache>,
+    ) -> Self {
         Self {
             model,
             cache,
@@ -606,7 +619,14 @@ impl<'a> Generate<'a> {
             history: Vec::new(),
             state: GenState::Prefill(prompt_token),
             should_cancel: Box::new(|| false),
+            prefill_snapshot: None,
         }
+    }
+
+    /// Consume the iterator, returning the advanced cache + the end-of-prefill
+    /// Linear snapshot (`None` if prefill never completed). See qwen3_5.
+    pub fn into_cache_and_snapshot(self) -> (Vec<LayerCache>, Option<Vec<LinearSnap>>) {
+        (self.cache, self.prefill_snapshot)
     }
 
     /// Install a cancellation predicate, polled between prefill chunks.
@@ -639,7 +659,7 @@ impl Iterator for Generate<'_> {
             GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
         let logits = if is_prefill {
-            match tri!(self.model.prefill_cancellable(
+            let l = match tri!(self.model.prefill_cancellable(
                 &inputs,
                 &mut self.cache,
                 crate::models::qwen3_5::prefill_chunk_size(),
@@ -647,7 +667,10 @@ impl Iterator for Generate<'_> {
             )) {
                 Some(l) => l,
                 None => return None,
-            }
+            };
+            // Snapshot the recurrent Linear state at end of prefill (see qwen3_5).
+            self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
+            l
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
