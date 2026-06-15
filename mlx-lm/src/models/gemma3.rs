@@ -13,7 +13,10 @@
 //!   - **Attention scale** `query_pre_attn_scalar^-0.5` (not `head_dim^-0.5` in general).
 //!   - **Tied embeddings** (the lm_head is the embedding read as a linear).
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use mlx_rs::{
     builder::Builder,
@@ -31,11 +34,46 @@ use crate::{
     cache::KeyValueCache,
     error::Error,
     models::qwen3::{repeat_window, sample_with, QuantizationConfig, SamplerOpts},
-    utils::rope::{initialize_rope, RopeVariant},
+    utils::rope::{initialize_rope, FloatOrString, RopeVariant},
 };
 
 fn default_true() -> bool {
     true
+}
+
+// Gemma 3 `text_config` defaults — the multimodal-wrapper checkpoints (4B/12B/27B, `model_type:
+// "gemma3"`) omit most of these and rely on the HF `Gemma3TextConfig` defaults. The flat text-only
+// 1B (`gemma3_text`) spells them all out, so these are only consulted for the wrapper form. Values
+// match HF transformers; verified to reconstruct 4B (heads→8), 12B (head_dim→256) and 27B exactly.
+fn d_num_heads() -> i32 {
+    8
+}
+fn d_num_kv_heads() -> i32 {
+    4
+}
+fn d_head_dim() -> i32 {
+    256
+}
+fn d_rms_eps() -> f32 {
+    1e-6
+}
+fn d_vocab() -> i32 {
+    262_208
+}
+fn d_max_pos() -> i32 {
+    131_072
+}
+fn d_rope_theta() -> f32 {
+    1_000_000.0
+}
+fn d_rope_local() -> f32 {
+    10_000.0
+}
+fn d_sw_pattern() -> i32 {
+    6
+}
+fn d_qpas() -> f32 {
+    256.0
 }
 
 thread_local! {
@@ -59,19 +97,34 @@ pub struct ModelArgs {
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
     pub intermediate_size: i32,
+    #[serde(default = "d_num_heads")]
     pub num_attention_heads: i32,
+    #[serde(default = "d_num_kv_heads")]
     pub num_key_value_heads: i32,
+    #[serde(default = "d_head_dim")]
     pub head_dim: i32,
+    #[serde(default = "d_rms_eps")]
     pub rms_norm_eps: f32,
+    #[serde(default = "d_vocab")]
     pub vocab_size: i32,
+    #[serde(default = "d_max_pos")]
     pub max_position_embeddings: i32,
+    #[serde(default = "d_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default = "d_rope_local")]
     pub rope_local_base_freq: f32,
     pub sliding_window: i32,
+    #[serde(default = "d_sw_pattern")]
     pub sliding_window_pattern: i32,
+    #[serde(default = "d_qpas")]
     pub query_pre_attn_scalar: f32,
+    // Linear RoPE scaling for the GLOBAL layers only (the 4B/12B/27B set
+    // `{"rope_type":"linear","factor":8.0}`; the 1B has none). Local layers never scale.
+    #[serde(default)]
+    pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
+    #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
 }
 
@@ -136,7 +189,11 @@ pub struct Attention {
 }
 
 impl Attention {
-    fn new(args: &ModelArgs, theta: f32) -> Result<Self, Exception> {
+    fn new(
+        args: &ModelArgs,
+        theta: f32,
+        scaling: &Option<HashMap<String, FloatOrString>>,
+    ) -> Result<Self, Exception> {
         let d = args.hidden_size;
         let nh = args.num_attention_heads;
         let nkv = args.num_key_value_heads;
@@ -147,7 +204,7 @@ impl Attention {
         let o_proj = nn::LinearBuilder::new(nh * hd, d).bias(false).build()?;
         let q_norm = GemmaRmsNorm::new(hd, args.rms_norm_eps);
         let k_norm = GemmaRmsNorm::new(hd, args.rms_norm_eps);
-        let rope = initialize_rope(hd, theta, false, &None, args.max_position_embeddings)?;
+        let rope = initialize_rope(hd, theta, false, scaling, args.max_position_embeddings)?;
         Ok(Self {
             n_heads: nh,
             n_kv_heads: nkv,
@@ -309,9 +366,12 @@ impl DecoderLayer {
         // Every `sliding_window_pattern`-th layer is GLOBAL (rope_theta); the rest LOCAL.
         let is_global = (layer_idx + 1) % args.sliding_window_pattern == 0;
         let theta = if is_global { args.rope_theta } else { args.rope_local_base_freq };
+        // Linear RoPE scaling (long-context) is applied to GLOBAL layers only; the local
+        // sliding-window layers always use the unscaled `rope_local_base_freq`.
+        let scaling = if is_global { args.rope_scaling.clone() } else { None };
         Ok(Self {
             is_local: !is_global,
-            self_attn: Attention::new(args, theta)?,
+            self_attn: Attention::new(args, theta, &scaling)?,
             mlp: Mlp::new(args.hidden_size, args.intermediate_size)?,
             input_layernorm: GemmaRmsNorm::new(args.hidden_size, args.rms_norm_eps),
             post_attention_layernorm: GemmaRmsNorm::new(args.hidden_size, args.rms_norm_eps),
@@ -535,15 +595,40 @@ struct WeightMap {
 
 pub fn load_gemma3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let args: ModelArgs =
+
+    // Two config shapes share `gemma3.rs`:
+    //   - flat text-only (`model_type: "gemma3_text"`, the 1B): the whole config IS the text model.
+    //   - multimodal wrapper (`model_type: "gemma3"`, the 4B/12B/27B): the text model lives under
+    //     `text_config`, `quantization` sits at the top level, and the language-model weights are
+    //     prefixed `language_model.` alongside `vision_tower.*` / `multi_modal_projector.*` (which we
+    //     drop — this is a text-only runtime).
+    let root: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let multimodal = root.get("text_config").is_some();
+    let args: ModelArgs = if multimodal {
+        let mut text = root["text_config"].clone();
+        // `quantization` is top-level in the wrapper; graft it onto the text config so `ModelArgs`
+        // sees it (the text model itself is what gets quantized).
+        if text.get("quantization").is_none() {
+            if let Some(q) = root.get("quantization") {
+                if let Some(obj) = text.as_object_mut() {
+                    obj.insert("quantization".to_string(), q.clone());
+                }
+            }
+        }
+        serde_json::from_value(text)?
+    } else {
+        serde_json::from_value(root)?
+    };
     let quantization = args.quantization.clone();
 
-    // Gather every weight tensor up front (so we can detect a materialized `lm_head`).
+    // Gather every weight tensor up front (so we can detect a materialized `lm_head`). For the
+    // wrapper, strip the `language_model.` prefix and skip the vision/projector tensors so the keys
+    // line up with the text model's parameter paths (identical to the flat checkpoint's).
     let mut loaded: std::collections::HashMap<String, Array> = std::collections::HashMap::new();
     let index = model_dir.join("model.safetensors.index.json");
-    let files: Vec<std::path::PathBuf> = if index.exists() {
-        let wm: WeightMap = serde_json::from_str(&std::fs::read_to_string(index)?)?;
+    let from_index: Vec<std::path::PathBuf> = if index.exists() {
+        let wm: WeightMap = serde_json::from_str(&std::fs::read_to_string(&index)?)?;
         wm.weight_map
             .values()
             .collect::<HashSet<_>>()
@@ -551,11 +636,34 @@ pub fn load_gemma3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
             .map(|f| model_dir.join(f))
             .collect()
     } else {
-        vec![model_dir.join("model.safetensors")]
+        Vec::new()
+    };
+    // Trust the index only when every shard it names is actually present. Some mlx-community
+    // uploads ship a STALE index that references sharded filenames (`model-0000N-of-...`) after
+    // the weights were consolidated into a single `model.safetensors` — in that case (or no index
+    // at all) fall back to every `*.safetensors` physically in the directory.
+    let files: Vec<std::path::PathBuf> = if !from_index.is_empty() && from_index.iter().all(|p| p.exists()) {
+        from_index
+    } else {
+        let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+            .collect();
+        found.sort();
+        found
     };
     for f in files {
         for (k, v) in mlx_rs::Array::load_safetensors(&f)? {
-            loaded.insert(k, v);
+            let key = if multimodal {
+                if k.starts_with("vision_tower.") || k.starts_with("multi_modal_projector.") {
+                    continue;
+                }
+                k.strip_prefix("language_model.").map(str::to_string).unwrap_or(k)
+            } else {
+                k
+            };
+            loaded.insert(key, v);
         }
     }
 
@@ -697,5 +805,34 @@ mod tests {
             let keep = j <= 5 && j > 3; // keys 4,5
             assert_eq!(lv2[j as usize], if keep { 0.0 } else { neg }, "decode local[{j}]");
         }
+    }
+
+    // The multimodal-wrapper config (4B/12B/27B) nests the text model under `text_config` and omits
+    // most head fields, relying on the Gemma3 defaults. Deserializing a 4B-shaped `text_config` must
+    // reconstruct the real architecture (heads 8, kv 4, head_dim 256, sliding_window_pattern 6,
+    // query_pre_attn_scalar 256) and parse the linear RoPE scaling. No model/weights needed.
+    #[test]
+    fn wrapper_text_config_fills_gemma3_defaults() {
+        // Exactly the keys mlx-community/gemma-3-4b-it-4bit lists under `text_config`.
+        let json = r#"{
+            "model_type": "gemma3_text",
+            "hidden_size": 2560,
+            "intermediate_size": 10240,
+            "num_hidden_layers": 34,
+            "sliding_window": 1024,
+            "rope_scaling": {"rope_type": "linear", "factor": 8.0}
+        }"#;
+        let args: super::ModelArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.num_attention_heads, 8, "heads default");
+        assert_eq!(args.num_key_value_heads, 4, "kv default");
+        assert_eq!(args.head_dim, 256, "head_dim default");
+        assert_eq!(args.sliding_window_pattern, 6, "sw pattern default");
+        assert_eq!(args.query_pre_attn_scalar, 256.0, "qpas default");
+        assert_eq!(args.rope_theta, 1_000_000.0, "rope_theta default");
+        assert_eq!(args.rope_local_base_freq, 10_000.0, "rope_local default");
+        assert!(args.tie_word_embeddings, "tied by default");
+        // The linear scaling parsed for the global layers.
+        let sc = args.rope_scaling.expect("rope_scaling present");
+        assert!(sc.contains_key("factor") && sc.contains_key("rope_type"));
     }
 }
