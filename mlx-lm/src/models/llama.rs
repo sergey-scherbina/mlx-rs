@@ -19,6 +19,24 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+thread_local! {
+    /// Per-row RoPE start offsets for **ragged batched decode** (a `[B]` array). When set, the
+    /// Llama `Attention` ropes q/k at `cache.offset() − pad_offsets` (per row) via
+    /// `RopeVariant::forward_dynamic`, so a left-padded batch of different-length sequences is
+    /// rotated at each row's true position. `None` (default) → the normal single-offset path, so
+    /// B=1 is byte-identical. Set before a batched forward + cleared after; the per-row key-pad
+    /// mask is threaded separately via `AttentionInput.mask`. (Independent of `qwen3`'s identical
+    /// thread-local — the worker sets both; only the loaded arch's attention reads its own.)
+    static BATCH_PAD_OFFSETS: std::cell::RefCell<Option<Array>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear with `None`) the per-row RoPE pad offsets for ragged batched decode on the
+/// Llama path — see [`BATCH_PAD_OFFSETS`].
+pub fn set_batch_pad_offsets(offsets: Option<Array>) {
+    BATCH_PAD_OFFSETS.with(|c| *c.borrow_mut() = offsets);
+}
+
 use crate::{
     cache::KeyValueCache,
     error::Error,
@@ -164,15 +182,28 @@ where
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(cache) = cache.as_mut() {
-            let q_input = nn::RopeInputBuilder::new(&queries)
-                .offset(cache.offset())
-                .build()?;
-            queries = self.rope.forward(q_input)?;
-            let k_input = nn::RopeInputBuilder::new(&keys)
-                .offset(cache.offset())
-                .build()?;
-            keys = self.rope.forward(k_input)?;
-
+            // Ragged batched decode: rope each row at `cache.offset() − pad_i` (its true
+            // position); else the normal shared scalar offset.
+            let per_row = BATCH_PAD_OFFSETS.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .map(|pad| Array::from_int(cache.offset()).subtract(pad))
+            });
+            match per_row {
+                Some(offsets) => {
+                    let offsets = offsets?;
+                    queries = self.rope.forward_dynamic(&queries, &offsets)?;
+                    keys = self.rope.forward_dynamic(&keys, &offsets)?;
+                }
+                None => {
+                    queries = self.rope.forward(
+                        nn::RopeInputBuilder::new(&queries).offset(cache.offset()).build()?,
+                    )?;
+                    keys = self
+                        .rope
+                        .forward(nn::RopeInputBuilder::new(&keys).offset(cache.offset()).build()?)?;
+                }
+            }
             (keys, values) = cache.update_and_fetch(keys, values)?;
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
