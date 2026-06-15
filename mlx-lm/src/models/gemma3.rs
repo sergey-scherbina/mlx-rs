@@ -38,6 +38,21 @@ fn default_true() -> bool {
     true
 }
 
+thread_local! {
+    /// Per-row RoPE start offsets for ragged batched DECODE (a `[B]` array) — see qwen3/llama's
+    /// identical thread-local. When set, `Attention` ropes q/k per-row via `forward_dynamic`, and
+    /// [`Gemma3Model`] treats the caller's mask as the per-row global (pad) mask and derives the
+    /// local mask from it + the sliding window. `None` (default) → the serial path (unchanged).
+    static BATCH_PAD_OFFSETS: std::cell::RefCell<Option<Array>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear with `None`) the per-row RoPE pad offsets for ragged batched decode on the
+/// Gemma 3 path — see [`BATCH_PAD_OFFSETS`].
+pub fn set_batch_pad_offsets(offsets: Option<Array>) {
+    BATCH_PAD_OFFSETS.with(|c| *c.borrow_mut() = offsets);
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -186,12 +201,27 @@ where
         let mut queries = queries;
         let mut keys = keys;
         let (keys, values) = if let Some(cache) = cache.as_mut() {
-            queries = self
-                .rope
-                .forward(nn::RopeInputBuilder::new(&queries).offset(cache.offset()).build()?)?;
-            keys = self
-                .rope
-                .forward(nn::RopeInputBuilder::new(&keys).offset(cache.offset()).build()?)?;
+            // Ragged batched decode: per-row rope at `cache.offset() − pad_i`; else scalar.
+            let per_row = BATCH_PAD_OFFSETS.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .map(|pad| Array::from_int(cache.offset()).subtract(pad))
+            });
+            match per_row {
+                Some(offsets) => {
+                    let offsets = offsets?;
+                    queries = self.rope.forward_dynamic(&queries, &offsets)?;
+                    keys = self.rope.forward_dynamic(&keys, &offsets)?;
+                }
+                None => {
+                    queries = self.rope.forward(
+                        nn::RopeInputBuilder::new(&queries).offset(cache.offset()).build()?,
+                    )?;
+                    keys = self
+                        .rope
+                        .forward(nn::RopeInputBuilder::new(&keys).offset(cache.offset()).build()?)?;
+                }
+            }
             cache.update_and_fetch(keys, values)?
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
@@ -369,6 +399,14 @@ fn build_gemma_masks(
     Ok((global, local))
 }
 
+/// Boolean window keep-mask `[total]` for ragged batched DECODE: keep the last `window` key
+/// slots (`j >= total - window`). Rows are right-aligned in the batched cache, so the window is
+/// uniform across rows; AND-ed with the per-row pad mask it gives each row's local attention.
+fn build_window_keep(total: i32, window: i32) -> Result<Array, Exception> {
+    let kpos = mlx_rs::ops::arange::<_, i32>(0, total, None)?;
+    kpos.ge(&Array::from_int(total - window))
+}
+
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
     pub mask: Option<&'a Array>,
@@ -398,7 +436,14 @@ where
         // whenever the whole context fits in the window. An explicit caller mask (unused by
         // Gemma — it isn't batched) applies to every layer.
         let (global_mask, local_mask) = if let Some(m) = mask {
-            (Some(m.clone()), Some(m.clone()))
+            // Batched decode: `m` is the per-row pad keep-mask (the global mask). For local
+            // layers AND it with the sliding window (keep the last `window` key slots — rows are
+            // right-aligned so the window is uniform). `m` is `[B,1,1,total]`; the `[total]`
+            // window broadcasts.
+            let total = *m.shape().last().expect("mask has a key axis");
+            let win = build_window_keep(total, self.sliding_window)?;
+            let local = mlx_rs::ops::logical_and(m, &win)?;
+            (Some(m.clone()), Some(local))
         } else {
             let l = h.shape()[1];
             let offset = cache.first().and_then(|c| c.as_ref()).map_or(0, |c| c.offset());
