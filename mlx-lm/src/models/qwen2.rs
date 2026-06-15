@@ -28,6 +28,21 @@ use crate::{
     utils::rope::{initialize_rope, FloatOrString, RopeVariant},
 };
 
+thread_local! {
+    /// Per-row RoPE start offsets for ragged batched decode (a `[B]` array) — see
+    /// `qwen3`/`llama`'s identical thread-local. When set, `Attention` ropes q/k at
+    /// `cache.offset() − pad_i` per row via `forward_dynamic`; `None` (default) → the scalar
+    /// path, so B=1 is byte-identical. The key-pad mask is threaded via `AttentionInput.mask`.
+    static BATCH_PAD_OFFSETS: std::cell::RefCell<Option<Array>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear with `None`) the per-row RoPE pad offsets for ragged batched decode on the
+/// Qwen2 path — see [`BATCH_PAD_OFFSETS`].
+pub fn set_batch_pad_offsets(offsets: Option<Array>) {
+    BATCH_PAD_OFFSETS.with(|c| *c.borrow_mut() = offsets);
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -164,15 +179,27 @@ where
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(cache) = cache.as_mut() {
-            let q_input = nn::RopeInputBuilder::new(&queries)
-                .offset(cache.offset())
-                .build()?;
-            queries = self.rope.forward(q_input)?;
-            let k_input = nn::RopeInputBuilder::new(&keys)
-                .offset(cache.offset())
-                .build()?;
-            keys = self.rope.forward(k_input)?;
-
+            // Ragged batched decode: per-row rope at `cache.offset() − pad_i`; else scalar.
+            let per_row = BATCH_PAD_OFFSETS.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .map(|pad| Array::from_int(cache.offset()).subtract(pad))
+            });
+            match per_row {
+                Some(offsets) => {
+                    let offsets = offsets?;
+                    queries = self.rope.forward_dynamic(&queries, &offsets)?;
+                    keys = self.rope.forward_dynamic(&keys, &offsets)?;
+                }
+                None => {
+                    queries = self.rope.forward(
+                        nn::RopeInputBuilder::new(&queries).offset(cache.offset()).build()?,
+                    )?;
+                    keys = self
+                        .rope
+                        .forward(nn::RopeInputBuilder::new(&keys).offset(cache.offset()).build()?)?;
+                }
+            }
             (keys, values) = cache.update_and_fetch(keys, values)?;
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
