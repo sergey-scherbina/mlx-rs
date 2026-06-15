@@ -256,6 +256,8 @@ impl Module<&Array> for Mlp {
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct DecoderLayer {
+    /// Local (sliding-window) attention layer, vs a global (full-attention) one.
+    pub is_local: bool,
     #[quantizable]
     #[param]
     pub self_attn: Attention,
@@ -278,6 +280,7 @@ impl DecoderLayer {
         let is_global = (layer_idx + 1) % args.sliding_window_pattern == 0;
         let theta = if is_global { args.rope_theta } else { args.rope_local_base_freq };
         Ok(Self {
+            is_local: !is_global,
             self_attn: Attention::new(args, theta)?,
             mlp: Mlp::new(args.hidden_size, args.intermediate_size)?,
             input_layernorm: GemmaRmsNorm::new(args.hidden_size, args.rms_norm_eps),
@@ -317,6 +320,7 @@ where
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Gemma3Model {
     pub hidden_size: i32,
+    pub sliding_window: i32,
     #[quantizable]
     #[param]
     pub embed_tokens: MaybeQuantized<nn::Embedding>,
@@ -334,6 +338,7 @@ impl Gemma3Model {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             hidden_size: args.hidden_size,
+            sliding_window: args.sliding_window,
             embed_tokens: MaybeQuantized::Original(nn::Embedding::new(args.vocab_size, args.hidden_size)?),
             layers,
             norm: GemmaRmsNorm::new(args.hidden_size, args.rms_norm_eps),
@@ -361,24 +366,37 @@ where
         let normalizer = Array::from_f32((self.hidden_size as f32).sqrt()).as_dtype(h.dtype())?;
         h = h.multiply(&normalizer)?;
 
-        let mask = match mask {
-            Some(m) => Some(m.clone()),
-            None => {
-                if h.shape()[1] > 1 {
-                    Some(
-                        nn::MultiHeadAttention::create_additive_causal_mask::<f32>(h.shape()[1])?
-                            .as_dtype(h.dtype())?,
-                    )
-                } else {
-                    None
-                }
-            }
-        };
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
+        // GLOBAL layers attend causally to all keys; LOCAL (sliding-window) layers also drop
+        // keys older than `sliding_window`. Build both additive masks `[L, offset+L]` over the
+        // absolute positions (so they're correct at decode, where `offset > 0`); local == global
+        // whenever the whole context fits in the window. An explicit caller mask (unused by
+        // Gemma — it isn't batched) applies to every layer.
+        let (global_mask, local_mask) = if let Some(m) = mask {
+            (Some(m.clone()), Some(m.clone()))
+        } else {
+            let dt = h.dtype();
+            let l = h.shape()[1];
+            let offset = cache.first().and_then(|c| c.as_ref()).map_or(0, |c| c.offset());
+            let total = offset + l;
+            let qpos = mlx_rs::ops::arange::<_, i32>(offset, total, None)?.reshape(&[l, 1])?;
+            let kpos = mlx_rs::ops::arange::<_, i32>(0, total, None)?.reshape(&[1, total])?;
+            let zero = Array::from_f32(0.0);
+            let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+            let causal = mlx_rs::ops::r#where(&kpos.le(&qpos)?, &zero, &neg_inf)?;
+            let global = causal.as_dtype(dt)?;
+            // Keep only keys with `key > query - window` on top of the causal mask.
+            let thresh = qpos.subtract(Array::from_int(self.sliding_window))?;
+            let window = mlx_rs::ops::r#where(&kpos.gt(&thresh)?, &zero, &neg_inf)?;
+            let local = causal.add(&window)?.as_dtype(dt)?;
+            (Some(global), Some(local))
+        };
+
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(AttentionInput { x: &h, mask: mask.as_ref(), cache: c.as_mut() })?;
+            let m = if layer.is_local { local_mask.as_ref() } else { global_mask.as_ref() };
+            h = layer.forward(AttentionInput { x: &h, mask: m, cache: c.as_mut() })?;
         }
         self.norm.forward(&h)
     }
