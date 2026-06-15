@@ -7,9 +7,9 @@
 //!   - **Four norms per layer** (pre/post around both attention and the MLP).
 //!   - **GELU (tanh approx) MLP**, not SiLU.
 //!   - **Alternating local/global attention**: every `sliding_window_pattern`-th layer is GLOBAL
-//!     (RoPE base `rope_theta`, full attention); the rest are LOCAL (RoPE base `rope_local_base_freq`,
-//!     sliding window). The window is approximated by full attention here — exact for contexts within
-//!     the window, a bounded divergence beyond it (a windowed-mask follow-up; agent prompts are short).
+//!     (RoPE base `rope_theta`, full causal attention); the rest are LOCAL (RoPE base
+//!     `rope_local_base_freq`) and additionally mask keys older than `sliding_window` (see
+//!     [`build_gemma_masks`]). The two masks coincide when the context fits in the window.
 //!   - **Attention scale** `query_pre_attn_scalar^-0.5` (not `head_dim^-0.5` in general).
 //!   - **Tied embeddings** (the lm_head is the embedding read as a linear).
 
@@ -346,6 +346,29 @@ impl Gemma3Model {
     }
 }
 
+/// Build the `(global, local)` additive attention masks `[L, offset+L]` for Gemma's
+/// alternating attention: `global` is causal (`key <= query`); `local` additionally drops keys
+/// older than `window` (`key <= query - window`). Built over ABSOLUTE positions (`offset..`) so
+/// both are correct at decode; when the whole context fits in the window they're identical.
+fn build_gemma_masks(
+    offset: i32,
+    l: i32,
+    window: i32,
+    dt: Dtype,
+) -> Result<(Array, Array), Exception> {
+    let total = offset + l;
+    let qpos = mlx_rs::ops::arange::<_, i32>(offset, total, None)?.reshape(&[l, 1])?;
+    let kpos = mlx_rs::ops::arange::<_, i32>(0, total, None)?.reshape(&[1, total])?;
+    let zero = Array::from_f32(0.0);
+    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+    let causal = mlx_rs::ops::r#where(&kpos.le(&qpos)?, &zero, &neg_inf)?;
+    let global = causal.as_dtype(dt)?;
+    let thresh = qpos.subtract(Array::from_int(window))?;
+    let window_mask = mlx_rs::ops::r#where(&kpos.gt(&thresh)?, &zero, &neg_inf)?;
+    let local = causal.add(&window_mask)?.as_dtype(dt)?;
+    Ok((global, local))
+}
+
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
     pub mask: Option<&'a Array>,
@@ -377,21 +400,10 @@ where
         let (global_mask, local_mask) = if let Some(m) = mask {
             (Some(m.clone()), Some(m.clone()))
         } else {
-            let dt = h.dtype();
             let l = h.shape()[1];
             let offset = cache.first().and_then(|c| c.as_ref()).map_or(0, |c| c.offset());
-            let total = offset + l;
-            let qpos = mlx_rs::ops::arange::<_, i32>(offset, total, None)?.reshape(&[l, 1])?;
-            let kpos = mlx_rs::ops::arange::<_, i32>(0, total, None)?.reshape(&[1, total])?;
-            let zero = Array::from_f32(0.0);
-            let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-            let causal = mlx_rs::ops::r#where(&kpos.le(&qpos)?, &zero, &neg_inf)?;
-            let global = causal.as_dtype(dt)?;
-            // Keep only keys with `key > query - window` on top of the causal mask.
-            let thresh = qpos.subtract(Array::from_int(self.sliding_window))?;
-            let window = mlx_rs::ops::r#where(&kpos.gt(&thresh)?, &zero, &neg_inf)?;
-            let local = causal.add(&window)?.as_dtype(dt)?;
-            (Some(global), Some(local))
+            let (g, lo) = build_gemma_masks(offset, l, self.sliding_window, h.dtype())?;
+            (Some(g), Some(lo))
         };
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
@@ -605,5 +617,40 @@ where
         }
         self.state = GenerateState::Decode { y: y.clone() };
         Some(Ok(y))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_gemma_masks;
+    use mlx_rs::{transforms::eval, Dtype};
+
+    // The local mask must BAND the causal mask to the last `window` keys; the global mask is
+    // plain causal. Deterministic — proves the sliding window is active (no model needed).
+    #[test]
+    fn sliding_window_mask_bands_local_attention() {
+        // L=4 fresh prefill (offset 0), window 2.
+        let (g, l) = build_gemma_masks(0, 4, 2, Dtype::Float32).unwrap();
+        eval([&g, &l]).unwrap();
+        let (gv, lv) = (g.as_slice::<f32>(), l.as_slice::<f32>());
+        let neg = f32::NEG_INFINITY;
+        for i in 0..4i32 {
+            for j in 0..4i32 {
+                let idx = (i * 4 + j) as usize;
+                let g_keep = j <= i; // causal
+                let l_keep = g_keep && j > i - 2; // + within window 2
+                assert_eq!(gv[idx], if g_keep { 0.0 } else { neg }, "global[{i}][{j}]");
+                assert_eq!(lv[idx], if l_keep { 0.0 } else { neg }, "local[{i}][{j}]");
+            }
+        }
+
+        // Decode step at offset 5, L=1, window 2: the single query (pos 5) keeps keys 4,5.
+        let (_g2, l2) = build_gemma_masks(5, 1, 2, Dtype::Float32).unwrap();
+        eval([&l2]).unwrap();
+        let lv2 = l2.as_slice::<f32>(); // [1, 6]
+        for j in 0..6i32 {
+            let keep = j <= 5 && j > 3; // keys 4,5
+            assert_eq!(lv2[j as usize], if keep { 0.0 } else { neg }, "decode local[{j}]");
+        }
     }
 }
