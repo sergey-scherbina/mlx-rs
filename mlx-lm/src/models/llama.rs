@@ -43,7 +43,11 @@ use crate::{
     // The sampler is model-agnostic (operates on logit arrays); reuse qwen3's so
     // Llama gets top-p/top-k/repeat-penalty parity without duplicating it.
     models::qwen3::{repeat_window, sample_with, QuantizationConfig, SamplerOpts},
-    utils::rope::{initialize_rope, FloatOrString, RopeVariant},
+    utils::{
+        create_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
+    },
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -424,17 +428,16 @@ where
 
         let mut h = self.embed_tokens.forward(inputs)?;
 
+        // Cache-aware causal mask: with prefix reuse the cache holds `offset` prior
+        // positions, so the mask must be (T, offset+T), not (T, T). The old
+        // `create_additive_causal_mask(T)` ignored the offset and broke multi-turn
+        // prefix reuse (a (T,T) vs (1,H,T,offset+T) broadcast mismatch). Matches qwen3.
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
-            None => {
-                if h.shape()[1] > 1 {
-                    let m =
-                        nn::MultiHeadAttention::create_additive_causal_mask::<f32>(h.shape()[1])?;
-                    Some(m.as_dtype(h.dtype())?)
-                } else {
-                    None
-                }
-            }
+            None => match create_attention_mask(&h, cache, Some(true))? {
+                Some(AttentionMask::Array(a)) => Some(a),
+                _ => None,
+            },
         };
 
         if cache.is_empty() {
