@@ -939,12 +939,32 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         match &self.state {
             GenerateState::Prefill { prompt_token } => {
-                let input = ModelInput {
-                    inputs: prompt_token,
-                    mask: None,
-                    cache: self.cache,
+                // Chunk the prefill so a long prompt's forward (attention scores +
+                // MLP/lm_head activations) peaks at `[chunk, ctx]` instead of `[T, T]`.
+                // The cache advances across chunks and is eval'd between them to free each
+                // chunk's activations; only the cache is eval'd, so MLX's lazy graph skips
+                // `lm_head` on the discarded intermediate chunks (it's needed only for the
+                // final position). Byte-identical to a single forward of the last position
+                // — attention is position-local; chunking only changes when intermediates
+                // are freed. (`crate::models::qwen3_5::prefill_chunk_size`, env-tunable.)
+                let t = prompt_token.shape()[1];
+                let chunk = crate::models::qwen3_5::prefill_chunk_size();
+                let mut start = 0;
+                let logits = loop {
+                    let end = (start + chunk).min(t);
+                    let piece = prompt_token.index((.., start..end));
+                    let input = ModelInput { inputs: &piece, mask: None, cache: self.cache };
+                    let l = tri!(self.model.forward(input));
+                    if end == t {
+                        break l;
+                    }
+                    let mut to_eval: Vec<&Array> = Vec::new();
+                    for c in self.cache.iter().flatten() {
+                        c.collect_eval(&mut to_eval);
+                    }
+                    tri!(mlx_rs::transforms::eval(to_eval));
+                    start = end;
                 };
-                let logits = tri!(self.model.forward(input));
                 let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
                     repeat_window(&self.history)
                 } else {

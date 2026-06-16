@@ -38,7 +38,11 @@ use crate::{
 
 /// Default prompt-prefill chunk size (tokens). Caps the full-attention
 /// `[chunk, ctx]` causal-mask + score peak instead of `[T, T]` for a long prompt.
-const PREFILL_CHUNK_DEFAULT: i32 = 2048;
+/// 1024 (was 2048): on a 36 GB Mac a 2048-chunk activation spike + ~25 GB resident
+/// (35B-A3B) + KV + MLX cache topped the memory cap → a process-fatal Metal OOM. With
+/// prefix-reuse the per-turn prefill is incremental, so this only adds a few eval syncs
+/// on the first turn. Shared by the dense (`qwen3`/`qwen3_moe`) + Qwen3.6 prefill paths.
+const PREFILL_CHUNK_DEFAULT: i32 = 1024;
 /// Floor for a chunk size; tiny chunks only add per-chunk overhead.
 const PREFILL_CHUNK_MIN: i32 = 256;
 

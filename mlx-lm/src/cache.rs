@@ -30,6 +30,12 @@ pub trait KeyValueCache {
 
     fn update_and_fetch(&mut self, keys: Array, values: Array)
         -> Result<(Array, Array), Exception>;
+
+    /// Push the cache's live arrays into `out` so the caller can `eval` them — used
+    /// to materialize (and free) each prefill chunk's activations before the next
+    /// chunk, bounding the prefill memory peak. Default: nothing (caches with no
+    /// persistent arrays, or that don't benefit, opt out).
+    fn collect_eval<'a>(&'a self, _out: &mut Vec<&'a Array>) {}
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -62,6 +68,10 @@ where
         values: Array,
     ) -> Result<(Array, Array), Exception> {
         T::update_and_fetch(self, keys, values)
+    }
+
+    fn collect_eval<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        T::collect_eval(self, out)
     }
 }
 
@@ -204,6 +214,10 @@ impl KeyValueCache for ConcatKeyValueCache {
                 .unwrap()
                 .index((.., .., ..self.offset, ..)),
         ))
+    }
+
+    fn collect_eval<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        out.extend(self.state_arrays());
     }
 }
 

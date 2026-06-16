@@ -611,11 +611,31 @@ where
 
         match &self.state {
             GenerateState::Prefill { prompt_token } => {
-                let logits = tri!(self.model.forward(ModelInput {
-                    inputs: prompt_token,
-                    mask: None,
-                    cache: self.cache,
-                }));
+                // Chunked prefill: bound the per-chunk forward to `[chunk, ctx]` instead of
+                // `[T, T]`; eval the cache between chunks to free activations (MLX lazy-skips
+                // `lm_head` on discarded intermediate chunks). Byte-identical to a single
+                // forward of the last position. See qwen3::Generate for the rationale.
+                let t = prompt_token.shape()[1];
+                let chunk = crate::models::qwen3_5::prefill_chunk_size();
+                let mut start = 0;
+                let logits = loop {
+                    let end = (start + chunk).min(t);
+                    let piece = prompt_token.index((.., start..end));
+                    let l = tri!(self.model.forward(ModelInput {
+                        inputs: &piece,
+                        mask: None,
+                        cache: self.cache,
+                    }));
+                    if end == t {
+                        break l;
+                    }
+                    let mut to_eval: Vec<&Array> = Vec::new();
+                    for c in self.cache.iter().flatten() {
+                        c.collect_eval(&mut to_eval);
+                    }
+                    tri!(mlx_rs::transforms::eval(to_eval));
+                    start = end;
+                };
                 let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
                     repeat_window(&self.history)
                 } else {
