@@ -134,6 +134,7 @@ impl QSwitchLinear {
             self.group_size,
             self.bits,
             sorted,
+            None, // mode: affine (default)
         )
     }
 }

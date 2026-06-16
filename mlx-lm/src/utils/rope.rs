@@ -6,7 +6,7 @@ use mlx_rs::{
     error::Exception,
     module::Module,
     nn,
-    ops::{arange, which},
+    ops::{arange, maximum, minimum, which},
     Array,
 };
 use serde::Deserialize;
@@ -163,12 +163,129 @@ where
     fn training_mode(&mut self, _mode: bool) {}
 }
 
+/// YaRN RoPE: per-dimension frequency interpolation between extrapolation
+/// (high-frequency dims, left as-is) and interpolation (low-frequency dims,
+/// divided by `factor`) via a linear ramp, plus an attention `mscale` applied to
+/// q/k before rotation. A faithful port of Python `mlx_lm`'s `YarnRoPE`. Used by
+/// gpt-oss (`rope_type: "yarn"`).
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct YarnRope {
+    pub dimensions: i32,
+    pub traditional: bool,
+    pub scale: f32,
+    pub mscale: f32,
+    /// Pre-computed interpolated per-dim periods. Not a module parameter.
+    pub freqs: Array,
+}
+
+impl YarnRope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        scaling_factor: f32,
+        original_max_position_embeddings: i32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> Result<Self, Exception> {
+        let half_dims = dims / 2;
+        let orig_max = original_max_position_embeddings as f32;
+
+        // freq_extra = base ** (arange(0, dims, 2) / dims) — the un-scaled periods.
+        let indices = arange::<_, f32>(None, half_dims, None)?;
+        let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32))?;
+        let freq_extra = Array::from_f32(base).power(&exponents)?;
+        // freq_inter = scaling_factor * freq_extra — the fully-interpolated periods.
+        let freq_inter = freq_extra.multiply(Array::from_f32(scaling_factor))?;
+
+        // Correction range: which dims extrapolate (keep) vs interpolate (scale).
+        let find_dim = |num_rotations: f32| -> f32 {
+            (dims as f32 * (orig_max / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
+                / (2.0 * base.ln())
+        };
+        let low = find_dim(beta_fast).floor().max(0.0);
+        let mut high = find_dim(beta_slow).ceil().min((dims - 1) as f32);
+        if (high - low).abs() < f32::EPSILON {
+            high += 0.001; // prevent singularity
+        }
+
+        // freq_mask = 1 - clip((arange(half) - low) / (high - low), 0, 1)
+        let ramp = arange::<_, f32>(None, half_dims, None)?
+            .subtract(Array::from_f32(low))?
+            .divide(Array::from_f32(high - low))?;
+        let ramp = minimum(maximum(ramp, Array::from_f32(0.0))?, Array::from_f32(1.0))?;
+        let freq_mask = Array::from_f32(1.0).subtract(&ramp)?;
+
+        // _freqs = (freq_inter*freq_extra) / (freq_inter*freq_mask + freq_extra*(1-freq_mask))
+        let numer = freq_inter.multiply(&freq_extra)?;
+        let one_minus_mask = Array::from_f32(1.0).subtract(&freq_mask)?;
+        let denom = freq_inter
+            .multiply(&freq_mask)?
+            .add(&freq_extra.multiply(&one_minus_mask)?)?;
+        let freqs = numer.divide(&denom)?;
+
+        // mscale = get_mscale(scale, 1) / get_mscale(scale, 0); 1.0 when scale <= 1.
+        let get_mscale = |scale: f32, m: f32| -> f32 {
+            if scale <= 1.0 {
+                1.0
+            } else {
+                0.1 * m * scale.ln() + 1.0
+            }
+        };
+        let mscale = get_mscale(scaling_factor, 1.0) / get_mscale(scaling_factor, 0.0);
+
+        Ok(Self {
+            dimensions: dims,
+            traditional,
+            scale: 1.0,
+            mscale,
+            freqs,
+        })
+    }
+
+    /// Python scales `x[..., :dims]` by `mscale` before rope; gpt-oss has
+    /// `dims == head_dim` (the whole last axis), so scale the array directly.
+    fn pre_scale(&self, x: &Array) -> Result<Array, Exception> {
+        if self.mscale != 1.0 {
+            x.multiply(Array::from_f32(self.mscale))
+        } else {
+            Ok(x.clone())
+        }
+    }
+}
+
+impl<'a, Input> Module<Input> for YarnRope
+where
+    Input: Into<nn::RopeInput<'a>>,
+{
+    type Error = Exception;
+    type Output = Array;
+
+    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+        let nn::RopeInput { x, offset } = input.into();
+        let x = self.pre_scale(x)?;
+        mlx_rs::fast::rope(
+            &x,
+            self.dimensions,
+            self.traditional,
+            None::<f32>,
+            self.scale,
+            offset,
+            &self.freqs,
+        )
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
 /// Enum wrapping different RoPE variants so that `initialize_rope` can return
-/// either a standard RoPE or a Llama3 RoPE.
+/// a standard, Llama3, or YaRN RoPE.
 #[derive(Debug, Clone)]
 pub enum RopeVariant {
     Default(nn::Rope),
     Llama3(Llama3Rope),
+    Yarn(YarnRope),
 }
 
 // TODO: support derive ModuleParameters for enum
@@ -177,6 +294,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.num_parameters(),
             RopeVariant::Llama3(rope) => rope.num_parameters(),
+            RopeVariant::Yarn(rope) => rope.num_parameters(),
         }
     }
 
@@ -184,6 +302,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.freeze_parameters(_recursive),
             RopeVariant::Llama3(rope) => rope.freeze_parameters(_recursive),
+            RopeVariant::Yarn(rope) => rope.freeze_parameters(_recursive),
         }
     }
 
@@ -191,6 +310,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.unfreeze_parameters(_recursive),
             RopeVariant::Llama3(rope) => rope.unfreeze_parameters(_recursive),
+            RopeVariant::Yarn(rope) => rope.unfreeze_parameters(_recursive),
         }
     }
 
@@ -198,6 +318,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.parameters(),
             RopeVariant::Llama3(rope) => rope.parameters(),
+            RopeVariant::Yarn(rope) => rope.parameters(),
         }
     }
 
@@ -205,6 +326,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.parameters_mut(),
             RopeVariant::Llama3(rope) => rope.parameters_mut(),
+            RopeVariant::Yarn(rope) => rope.parameters_mut(),
         }
     }
 
@@ -212,6 +334,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.trainable_parameters(),
             RopeVariant::Llama3(rope) => rope.trainable_parameters(),
+            RopeVariant::Yarn(rope) => rope.trainable_parameters(),
         }
     }
 
@@ -219,6 +342,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.all_frozen(),
             RopeVariant::Llama3(rope) => rope.all_frozen(),
+            RopeVariant::Yarn(rope) => rope.all_frozen(),
         }
     }
 
@@ -226,6 +350,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.any_frozen(),
             RopeVariant::Llama3(rope) => rope.any_frozen(),
+            RopeVariant::Yarn(rope) => rope.any_frozen(),
         }
     }
 }
@@ -241,6 +366,7 @@ where
         match self {
             RopeVariant::Default(rope) => rope.forward(input),
             RopeVariant::Llama3(rope) => rope.forward(input),
+            RopeVariant::Yarn(rope) => rope.forward(input),
         }
     }
 
@@ -251,6 +377,9 @@ where
             }
             RopeVariant::Llama3(rope) => {
                 <Llama3Rope as Module<nn::RopeInput>>::training_mode(rope, mode)
+            }
+            RopeVariant::Yarn(rope) => {
+                <YarnRope as Module<nn::RopeInput>>::training_mode(rope, mode)
             }
         }
     }
@@ -283,6 +412,18 @@ impl RopeVariant {
                 offsets,
                 Some(&r.freqs),
             ),
+            RopeVariant::Yarn(r) => {
+                let x = r.pre_scale(x)?;
+                mlx_rs::fast::rope_dynamic(
+                    &x,
+                    r.dimensions,
+                    r.traditional,
+                    None::<f32>,
+                    r.scale,
+                    offsets,
+                    Some(&r.freqs),
+                )
+            }
         }
     }
 }
@@ -341,7 +482,27 @@ pub fn initialize_rope(
         )?;
         return Ok(RopeVariant::Llama3(rope));
     } else if rope_type == FloatOrStr::Str("yarn") {
-        todo!()
+        let config = scaling_config
+            .as_ref()
+            .ok_or_else(|| Exception::custom("scaling_config is required for yarn RoPE"))?;
+
+        let factor = get_numeric_from_config(config, "factor")?;
+        let original_max_position_embeddings =
+            get_numeric_from_config(config, "original_max_position_embeddings")? as i32;
+        // beta_fast/beta_slow default to the YaRN paper values when absent.
+        let beta_fast = get_numeric_from_config(config, "beta_fast").unwrap_or(32.0);
+        let beta_slow = get_numeric_from_config(config, "beta_slow").unwrap_or(1.0);
+
+        let rope = YarnRope::new(
+            dims,
+            traditional,
+            base,
+            factor,
+            original_max_position_embeddings,
+            beta_fast,
+            beta_slow,
+        )?;
+        return Ok(RopeVariant::Yarn(rope));
     } else if rope_type == FloatOrStr::Str("longrope") {
         todo!()
     }
