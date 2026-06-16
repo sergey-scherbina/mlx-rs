@@ -94,10 +94,70 @@ impl FromStr for Tokenizer {
     }
 }
 
+/// Minimal `strftime` over the current UTC time, supporting the specifiers chat
+/// templates use (`%Y %m %d %H %M %S`, `%%`; others pass through). gpt-oss needs
+/// only `%Y-%m-%d`. UTC is fine for a "Current date" system line.
+fn strftime_now(fmt: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{year:04}")),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('M') => out.push_str(&format!("{mm:02}")),
+            Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
 impl Tokenizer {
     pub fn from_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
         let mut env = Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // Functions HF injects into chat-template environments. gpt-oss's harmony
+        // template calls `strftime_now(...)` (the "Current date:" system line) and
+        // `raise_exception(...)`; without them the render fails ("value of type
+        // undefined is not callable").
+        env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
+        env.add_function("raise_exception", |msg: String| {
+            Err::<minijinja::Value, _>(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        });
         Self {
             inner: tokenizer,
             env,
