@@ -235,6 +235,11 @@ pub enum Content {
 pub struct Conversation<R, T> {
     pub role: R,
     pub content: T,
+    /// Structured tool calls for an assistant turn — needed by templates that
+    /// render tool calls natively (e.g. gpt-oss harmony: `message.tool_calls`).
+    /// `None` (the common case) is skipped, so single-field templates are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -687,6 +692,7 @@ mod tests {
         let conversations = vec![Conversation {
             role: Role::User,
             content: "hello",
+            tool_calls: None,
         }];
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
@@ -719,6 +725,7 @@ mod tests {
         let conversations = vec![Conversation {
             role: Role::User,
             content: "hello",
+            tool_calls: None,
         }];
 
         let mut tokenizer = super::Tokenizer::from_file(tokenizer_file).unwrap();
@@ -758,6 +765,7 @@ mod tests {
         let conversations = vec![Conversation {
             role: Role::User,
             content: "hello",
+            tool_calls: None,
         }];
         let mut tokenizer = super::Tokenizer::from_file(tokenizer_file).unwrap();
 

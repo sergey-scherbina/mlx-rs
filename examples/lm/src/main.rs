@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
     let conversations = vec![Conversation {
         role: Role::User,
         content: &prompt_text,
+        tool_calls: None,
     }];
     let args = ApplyChatTemplateArgs {
         conversations: vec![conversations.into()],
