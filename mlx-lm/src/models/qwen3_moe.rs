@@ -65,6 +65,12 @@ pub struct ModelArgs {
     pub mlp_only_layers: Vec<i32>,
     pub rope_scaling: Option<HashMap<String, crate::utils::rope::FloatOrString>>,
     pub quantization: Option<QuantizationConfig>,
+    /// Bit width of the MoE router (`mlp.gate`) when it differs from the rest — some
+    /// checkpoints (e.g. Qwen3-Coder) quantize the gate at 8-bit while everything
+    /// else is 4-bit. Not in config.json directly; derived from its per-tensor quant
+    /// override at load (0 = use the top-level bits). See `load_qwen3_moe_model`.
+    #[serde(skip)]
+    pub router_bits: i32,
 }
 
 impl ModelArgs {
@@ -215,11 +221,20 @@ impl SparseMoeBlock {
             .build()?;
         let q = args.quantization.as_ref();
         let (group_size, bits) = q.map(|q| (q.group_size, q.bits)).unwrap_or((64, 4));
+        // The router may use a different bit width (Qwen3-Coder: 8-bit gate). When it
+        // does, PRE-quantize the gate at its own bits so the uniform `nn::quantize`
+        // at load leaves it alone; otherwise leave it Original for that pass to handle.
+        let gate = if args.router_bits > 0 && args.router_bits != bits {
+            use mlx_rs::quantization::Quantizable as _;
+            MaybeQuantized::new(gate).quantize_with(|m| m.try_into_quantized(group_size, args.router_bits))?
+        } else {
+            MaybeQuantized::Original(gate)
+        };
         Ok(Self {
             top_k: args.num_experts_per_tok,
             num_experts: args.num_experts,
             norm_topk_prob: args.norm_topk_prob,
-            gate: MaybeQuantized::Original(gate),
+            gate,
             switch_mlp: SwitchGlu::new(group_size, bits),
         })
     }
@@ -486,8 +501,24 @@ pub struct WeightMap {
 
 pub fn load_qwen3_moe_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let file = std::fs::File::open(model_dir.join("config.json"))?;
-    let args: ModelArgs = serde_json::from_reader(file)?;
+    let config_text = std::fs::read_to_string(model_dir.join("config.json"))?;
+    let mut args: ModelArgs = serde_json::from_str(&config_text)?;
+    // Detect a per-tensor MoE-router (`mlp.gate`) quant override — some checkpoints
+    // (Qwen3-Coder) quantize the gate at 8-bit while the rest is 4-bit. Without this
+    // the uniform `nn::quantize` below builds a 4-bit gate and the 8-bit checkpoint
+    // weights don't fit (shape mismatch). 0 ⇒ use the top-level bits (uniform).
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&config_text) {
+        if let Some(q) = v.get("quantization").and_then(|q| q.as_object()) {
+            if let Some(gate_bits) = q
+                .iter()
+                .find(|(k, _)| k.ends_with(".mlp.gate"))
+                .and_then(|(_, gv)| gv.get("bits"))
+                .and_then(|b| b.as_i64())
+            {
+                args.router_bits = gate_bits as i32;
+            }
+        }
+    }
     let quantization = args.quantization.clone();
     let mut model = Model::new(args)?;
 
