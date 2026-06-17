@@ -838,7 +838,10 @@ where
                 } else {
                     &[]
                 };
-                let y = tri!(sample_with(&logits, &self.sampler, recent));
+                // Index the (single) last position to a 2-D `[B, vocab]` — matching
+                // the prefill path — so the repeat-penalty `take_along_axis` (which
+                // indexes `[B, vocab]` by the history) has matching dims.
+                let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler, recent));
                 record!(y);
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
