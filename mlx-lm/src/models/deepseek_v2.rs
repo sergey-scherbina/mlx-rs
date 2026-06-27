@@ -36,7 +36,7 @@ use crate::{
     models::qwen3_moe::SwitchGlu,
     utils::{
         create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+        rope::{initialize_rope, FloatOrString, RopeVariant, YarnRope},
         AttentionMask,
     },
 };
@@ -171,13 +171,34 @@ impl MlaAttention {
         let o_proj = lin(h * args.v_head_dim, d, false)?;
         // Decoupled RoPE on the qk_rope_head_dim part. YaRN via rope_scaling.
         // TODO(parity): replicate DeepseekV2YarnRotaryEmbedding (mscale on x + interpolated freqs).
-        let rope = initialize_rope(
-            args.qk_rope_head_dim,
-            args.rope_theta,
-            false,
-            &args.rope_scaling,
-            args.max_position_embeddings,
-        )?;
+        // RoPE: DeepSeek YaRN. Build YarnRope explicitly — its frequencies match the reference, but
+        // its built-in mscale uses gpt-oss's convention (get_mscale(scale,1)/get_mscale(scale,0)),
+        // NOT DeepSeek's (yarn_get_mscale(factor,mscale)/yarn_get_mscale(factor,mscale_all_dim)), so
+        // override it. traditional=true (the reference uses traditional rope).
+        let rope = match args.rope_scaling.as_ref() {
+            Some(rs) if matches!(rs.get("type"), Some(FloatOrString::String(s)) if s == "yarn") => {
+                let factor = rope_f(rs, "factor").unwrap_or(1.0);
+                let beta_fast = rope_f(rs, "beta_fast").unwrap_or(32.0);
+                let beta_slow = rope_f(rs, "beta_slow").unwrap_or(1.0);
+                let orig_max = rope_f(rs, "original_max_position_embeddings")
+                    .map(|v| v as i32)
+                    .unwrap_or(args.max_position_embeddings);
+                let mut yr = YarnRope::new(
+                    args.qk_rope_head_dim, true, args.rope_theta, factor, orig_max, beta_fast, beta_slow,
+                )?;
+                let msc = rope_f(rs, "mscale").unwrap_or(1.0);
+                let msc_all = rope_f(rs, "mscale_all_dim").unwrap_or(0.0);
+                yr.mscale = yarn_get_mscale(factor, msc) / yarn_get_mscale(factor, msc_all);
+                RopeVariant::Yarn(yr)
+            }
+            _ => initialize_rope(
+                args.qk_rope_head_dim,
+                args.rope_theta,
+                true,
+                &args.rope_scaling,
+                args.max_position_embeddings,
+            )?,
+        };
         Ok(Self {
             num_heads: h,
             qk_nope_head_dim: args.qk_nope_head_dim,
