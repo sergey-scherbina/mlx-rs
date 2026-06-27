@@ -89,6 +89,18 @@ fn d_true() -> bool { true }
 fn d_one_i() -> i32 { 1 }
 fn d_one_f32() -> f32 { 1.0 }
 
+/// DeepSeek YaRN attention-scale multiplier: `0.1 * mscale * ln(scale) + 1` (1.0 when scale<=1).
+fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 { 1.0 } else { 0.1 * mscale * scale.ln() + 1.0 }
+}
+/// Read a numeric field out of the `rope_scaling` map.
+fn rope_f(rs: &HashMap<String, FloatOrString>, k: &str) -> Option<f32> {
+    match rs.get(k) {
+        Some(FloatOrString::Float(v)) => Some(*v),
+        _ => None,
+    }
+}
+
 impl ModelArgs {
     fn is_moe(&self, layer_idx: i32) -> bool {
         self.n_routed_experts > 0
@@ -125,8 +137,18 @@ impl MlaAttention {
         let d = args.hidden_size;
         let h = args.num_attention_heads;
         let q_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim;
-        // scale = q_head_dim^-0.5  (× YaRN mscale² when rope_scaling.mscale_all_dim — TODO).
-        let scale = (q_head_dim as f32).powf(-0.5);
+        // scale = q_head_dim^-0.5, boosted by YaRN mscale² when rope_scaling.mscale_all_dim is set
+        // (DeepSeek: scale *= yarn_get_mscale(factor, mscale_all_dim)^2). Missing this under-scales
+        // attention → flat softmax → degenerate (repeating) output.
+        let mut scale = (q_head_dim as f32).powf(-0.5);
+        if let Some(rs) = &args.rope_scaling {
+            let mscale_all_dim = rope_f(rs, "mscale_all_dim").unwrap_or(0.0);
+            if mscale_all_dim != 0.0 {
+                let factor = rope_f(rs, "factor").unwrap_or(1.0);
+                let m = yarn_get_mscale(factor, mscale_all_dim);
+                scale *= m * m;
+            }
+        }
         let lin = |i, o, b| nn::LinearBuilder::new(i, o).bias(b).build();
         let rms = |dim| nn::RmsNormBuilder::new(dim).eps(args.rms_norm_eps).build();
         // q low-rank (q_a→norm→q_b) when q_lora_rank is set; else a single q_proj (Lite variant).
