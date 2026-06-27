@@ -2,6 +2,7 @@ pub mod gated_delta;
 pub mod gemma3;
 pub mod deepseek_v2;
 pub mod glm4;
+pub mod glm4_moe_lite;
 pub mod gpt_oss;
 pub mod llama;
 pub mod qwen2;
