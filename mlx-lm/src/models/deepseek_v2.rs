@@ -286,7 +286,9 @@ pub struct DeepseekV2MoE {
     pub top_k: i32,
     pub num_experts: i32,
     pub routed_scaling_factor: f32,
-    #[quantizable] #[param] pub gate: MaybeQuantized<nn::Linear>,
+    // The DeepSeek router gate is bf16 in the checkpoint (no `.scales`) — NOT `#[quantizable]`, so
+    // the uniform nn::quantize leaves it Original; quantizing it → quantized_matmul on bf16 panics.
+    #[param] pub gate: MaybeQuantized<nn::Linear>,
     #[param] pub switch_mlp: SwitchGlu,
     #[quantizable] #[param] pub shared_experts: Option<DeepseekV2MLP>,
 }
