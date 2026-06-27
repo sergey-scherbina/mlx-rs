@@ -1,13 +1,24 @@
 //! GLM-4 **MoE** (Zhipu/Z.ai) — `model_type: "glm4_moe"` (GLM-4.5-Air, GLM-4.6) and
 //! `"glm4_moe_lite"` (GLM-4.7-Flash). PORT SCAFFOLD — see `rozum:docs/specs/glm4-moe-native.md`.
 //!
-//! PORT STATUS: WIP scaffold, **not yet registered in `models/mod.rs`** (so the fork keeps
-//! building). Finish the `todo!()`s + the verbatim copies from `glm4.rs`, then register + bump the
-//! rozum fork pin. Validate with the byte-parity oracle (slot-gated; one model on the 36 GiB host).
+//! PORT STATUS: PARKED scaffold, **not registered in `models/mod.rs`** (fork keeps building).
 //!
-//! = `glm4.rs` (KEEP VERBATIM: partial+traditional RoPE `Attention`, the 4-norm sandwich
-//!   `DecoderLayer`, embedding/final-norm `Model`, the AFQ-remap `load_*` skeleton)
-//! + the dense `Mlp` REPLACED, per layer, by a MoE FFN.
+//! ⚠️ CHECKPOINT FINDING (2026-06-27): the two GLM-MoE families differ by ATTENTION:
+//!   - `glm4_moe` (GLM-4.5-Air / GLM-4.6) = standard **GQA** → glm4.rs attention reuse holds, BUT
+//!     these are too big for the 36 GiB host.
+//!   - `glm4_moe_lite` (**GLM-4.7-Flash**, the only one that fits) = **MLA** (DeepSeek-V2 latent
+//!     attention: `q_a_proj`/`q_a_layernorm`/`q_b_proj`, `kv_a_proj_with_mqa`/`kv_a_layernorm`;
+//!     q_lora 768 / kv_lora 512 / qk_nope 192 / qk_rope 64 / v_head_dim 256). glm4.rs attention does
+//!     NOT apply. → HIGH effort, shares MLA with the deepseek_v2 port (do the MLA kernel once).
+//!   Also: dense layer (first_k_dense_layers=1) FFN is SPLIT `mlp.{gate,up,down}_proj`, not glm4's
+//!   fused `gate_up_proj`. MoE: `mlp.switch_mlp.*` + `mlp.shared_experts.*` +
+//!   `mlp.gate.e_score_correction_bias`. See rozum:docs/specs/glm4-moe-native.md.
+//!
+//! The dense/GQA reuse notes below apply ONLY to `glm4_moe` (unrunnable here). For `glm4_moe_lite`
+//! the attention must be MLA — finish only after the shared MLA kernel exists.
+//!
+//! = `glm4.rs` (GQA path only: partial RoPE `Attention`, 4-norm sandwich, embedding/final-norm,
+//!   AFQ-remap `load_*`) + the dense `Mlp` REPLACED, per layer, by a MoE FFN.
 //!
 //! The MoE block is NOT a plain copy of `qwen3_moe::SparseMoeBlock`. GLM-4 MoE routes
 //! DeepSeek-V3-style; the differences vs Qwen3-MoE (flat softmax top-k) are the real work:
