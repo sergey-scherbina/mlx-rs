@@ -19,9 +19,9 @@ use mlx_rs::{
     module::{Module, ModuleParameters, ModuleParametersExt},
     nn,
     ops::{
-        argpartition_axis, concatenate_axis, expand_dims_axes,
+        argpartition_axis, broadcast_to, concatenate_axis, expand_dims_axes,
         indexing::{take_along_axis, IndexOp, NewAxis},
-        repeat_axis, softmax_axis,
+        softmax_axis,
     },
     quantization::MaybeQuantized,
     Array,
@@ -200,7 +200,8 @@ where
         let offset = cache.as_ref().map(|c| c.offset()).unwrap_or(0);
         q_pe = self.rope.forward(nn::RopeInputBuilder::new(&q_pe).offset(offset).build()?)?;
         k_pe = self.rope.forward(nn::RopeInputBuilder::new(&k_pe).offset(offset).build()?)?;
-        let k_pe = repeat_axis(&k_pe, self.num_heads, 1)?; // [B,H,L,rope_d]
+        // broadcast the single MQA rope head to all query heads (== mx.repeat on a size-1 axis).
+        let k_pe = broadcast_to(&k_pe, &[B, self.num_heads, L, rope_d])?; // [B,H,L,rope_d]
 
         let queries = concatenate_axis(&[q_nope, q_pe], -1)?;
         let keys_full = concatenate_axis(&[k_nope, k_pe], -1)?;

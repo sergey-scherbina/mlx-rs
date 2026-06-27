@@ -1,5 +1,6 @@
 pub mod gated_delta;
 pub mod gemma3;
+pub mod deepseek_v2;
 pub mod glm4;
 pub mod gpt_oss;
 pub mod llama;
