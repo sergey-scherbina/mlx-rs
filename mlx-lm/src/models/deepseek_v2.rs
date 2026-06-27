@@ -57,7 +57,8 @@ pub struct ModelArgs {
     #[serde(default = "d_true")]
     pub tie_word_embeddings: bool,
     // ── MLA latent dims ──────────────────────────────────────────────────────────────────────
-    pub q_lora_rank: i32,
+    /// `None` (config `null`, e.g. DeepSeek-Coder-V2-Lite) ⇒ no q low-rank: a plain `q_proj`.
+    pub q_lora_rank: Option<i32>,
     pub kv_lora_rank: i32,
     pub qk_nope_head_dim: i32,
     pub qk_rope_head_dim: i32,
@@ -107,9 +108,11 @@ pub struct MlaAttention {
     pub kv_lora_rank: i32,
     pub scale: f32,
 
-    #[quantizable] #[param] pub q_a_proj: MaybeQuantized<nn::Linear>,
-    #[param] pub q_a_layernorm: nn::RmsNorm,
-    #[quantizable] #[param] pub q_b_proj: MaybeQuantized<nn::Linear>,
+    // q path: either a plain `q_proj` (q_lora_rank null) OR the low-rank q_a→norm→q_b trio.
+    #[quantizable] #[param] pub q_proj: Option<MaybeQuantized<nn::Linear>>,
+    #[quantizable] #[param] pub q_a_proj: Option<MaybeQuantized<nn::Linear>>,
+    #[param] pub q_a_layernorm: Option<nn::RmsNorm>,
+    #[quantizable] #[param] pub q_b_proj: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable] #[param] pub kv_a_proj_with_mqa: MaybeQuantized<nn::Linear>,
     #[param] pub kv_a_layernorm: nn::RmsNorm,
     #[quantizable] #[param] pub kv_b_proj: MaybeQuantized<nn::Linear>,
@@ -126,8 +129,21 @@ impl MlaAttention {
         let scale = (q_head_dim as f32).powf(-0.5);
         let lin = |i, o, b| nn::LinearBuilder::new(i, o).bias(b).build();
         let rms = |dim| nn::RmsNormBuilder::new(dim).eps(args.rms_norm_eps).build();
-        let q_a_proj = lin(d, args.q_lora_rank, args.attention_bias)?;
-        let q_b_proj = lin(args.q_lora_rank, h * q_head_dim, false)?;
+        // q low-rank (q_a→norm→q_b) when q_lora_rank is set; else a single q_proj (Lite variant).
+        let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) = match args.q_lora_rank {
+            Some(qr) if qr > 0 => (
+                None,
+                Some(MaybeQuantized::Original(lin(d, qr, args.attention_bias)?)),
+                Some(rms(qr)?),
+                Some(MaybeQuantized::Original(lin(qr, h * q_head_dim, false)?)),
+            ),
+            _ => (
+                Some(MaybeQuantized::Original(lin(d, h * q_head_dim, false)?)),
+                None,
+                None,
+                None,
+            ),
+        };
         let kv_a_proj_with_mqa = lin(d, args.kv_lora_rank + args.qk_rope_head_dim, args.attention_bias)?;
         let kv_b_proj = lin(args.kv_lora_rank, h * (args.qk_nope_head_dim + args.v_head_dim), false)?;
         let o_proj = lin(h * args.v_head_dim, d, false)?;
@@ -148,9 +164,10 @@ impl MlaAttention {
             v_head_dim: args.v_head_dim,
             kv_lora_rank: args.kv_lora_rank,
             scale,
-            q_a_proj: MaybeQuantized::Original(q_a_proj),
-            q_a_layernorm: rms(args.q_lora_rank)?,
-            q_b_proj: MaybeQuantized::Original(q_b_proj),
+            q_proj,
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
             kv_a_proj_with_mqa: MaybeQuantized::Original(kv_a_proj_with_mqa),
             kv_a_layernorm: rms(args.kv_lora_rank)?,
             kv_b_proj: MaybeQuantized::Original(kv_b_proj),
@@ -180,7 +197,14 @@ where
         let (B, L) = (s[0], s[1]);
         let (nope, rope_d, vd) = (self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim);
 
-        let q = self.q_b_proj.forward(&self.q_a_layernorm.forward(&self.q_a_proj.forward(x)?)?)?;
+        let q = match self.q_proj.as_mut() {
+            Some(qp) => qp.forward(x)?,
+            None => {
+                let qa = self.q_a_proj.as_mut().unwrap().forward(x)?;
+                let qa = self.q_a_layernorm.as_mut().unwrap().forward(&qa)?;
+                self.q_b_proj.as_mut().unwrap().forward(&qa)?
+            }
+        };
         let q = q.reshape(&[B, L, self.num_heads, self.q_head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
         let q_nope = q.index((.., .., .., 0..nope));
         let mut q_pe = q.index((.., .., .., nope..(nope + rope_d)));
@@ -219,9 +243,10 @@ where
     }
 
     fn training_mode(&mut self, mode: bool) {
-        self.q_a_proj.training_mode(mode);
-        self.q_a_layernorm.training_mode(mode);
-        self.q_b_proj.training_mode(mode);
+        if let Some(m) = self.q_proj.as_mut() { m.training_mode(mode); }
+        if let Some(m) = self.q_a_proj.as_mut() { m.training_mode(mode); }
+        if let Some(m) = self.q_a_layernorm.as_mut() { m.training_mode(mode); }
+        if let Some(m) = self.q_b_proj.as_mut() { m.training_mode(mode); }
         self.kv_a_proj_with_mqa.training_mode(mode);
         self.kv_a_layernorm.training_mode(mode);
         self.kv_b_proj.training_mode(mode);
