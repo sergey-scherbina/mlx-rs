@@ -305,6 +305,9 @@ where
             }
             None => pe_scores,
         };
+        // SDPA requires the additive mask to promote to the output (bf16) dtype — the f32 scale
+        // multiply + f32::MIN where-fill leave pe_scores in f32, which does NOT promote to bf16.
+        let pe_scores = pe_scores.as_dtype(q_nope.dtype())?;
 
         // L==1 (decode): absorb q into latent, attend in latent space, unembed the output.
         // L>1  (prefill): unembed the latent into per-head k/v, attend in nope/v space.
