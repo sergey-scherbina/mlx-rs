@@ -177,19 +177,30 @@ pub struct SparseMoeBlock {
 
 impl SparseMoeBlock {
     fn new(args: &ModelArgs) -> Result<Self, Exception> {
-        let (gs, bits) = args
-            .quantization
-            .as_ref()
-            .map(|q| (q.group_size, q.bits))
-            .unwrap_or((64, 4));
-        // gate + shared_expert_gate are 8-bit in the checkpoint; experts 4-bit.
+        let gs = args.quantization.as_ref().map(|q| q.group_size).unwrap_or(64);
+        // The MoE experts (switch_mlp + shared_expert) are quantized at EXPERT_BITS, which can DIFFER
+        // from the model's global `bits`: a DWQ / mixed-precision checkpoint keeps attention + embed +
+        // lm_head at 8-bit but the experts at 4-bit (better quality at the same size). The old code fed
+        // switch_mlp the global `bits` (8 for DWQ), so its `gather_qmm` saw a 4-bit-checkpoint vs
+        // 8-bit-structure shape mismatch and the model couldn't run at all. gate + shared_expert_gate
+        // stay 8-bit (the existing per-leaf hardcodes). The standard uniform-4-bit 35B ALSO has 4-bit
+        // experts, so 4 is correct for both — and the model-level uniform `nn::quantize` still applies
+        // the global `bits` to attention/embed/lm_head.
+        const EXPERT_BITS: i32 = 4;
         Ok(Self {
             top_k: args.num_experts_per_tok,
             num_experts: args.num_experts,
             norm_topk_prob: args.norm_topk_prob,
             gate: QuantLinear::new(gs, 8),
-            switch_mlp: SwitchGlu::new(gs, bits),
-            shared_expert: Mlp::new(args.hidden_size, args.shared_expert_intermediate_size)?,
+            switch_mlp: SwitchGlu::new(gs, EXPERT_BITS),
+            // Pre-quantize the shared expert at EXPERT_BITS. Its leaves are `MaybeQuantized`, so the
+            // model-level uniform `nn::quantize` (run at the global `bits`) idempotently SKIPS them —
+            // they stay at EXPERT_BITS instead of being forced to the global width.
+            shared_expert: mlx_rs::nn::quantize(
+                Mlp::new(args.hidden_size, args.shared_expert_intermediate_size)?,
+                gs,
+                EXPERT_BITS,
+            )?,
             shared_expert_gate: QuantLinear::new(gs, 8),
         })
     }
