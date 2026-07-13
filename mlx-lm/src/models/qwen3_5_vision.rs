@@ -419,6 +419,84 @@ fn bilinear_indices_and_weights(
 }
 
 // ---------------------------------------------------------------------------
+// Multimodal M-RoPE host helpers (mirror transformers `get_rope_index` +
+// interleaved M-RoPE). Text tokens get sequential (equal) 3D positions; the
+// contiguous image-token block gets (t,h,w) grid positions, and the running
+// position advances by `max(h,w)/merge` across the image (position compression).
+// ---------------------------------------------------------------------------
+
+/// Per-token 3D M-RoPE positions for a single-image Qwen3.5 prompt. Returns
+/// `(positions, next_pos)` where `next_pos` is the scalar position of the first
+/// decoded token (all three axes equal for text). The image-token block is
+/// assumed contiguous; its length must equal `t * (h/merge) * (w/merge)`.
+pub fn rope_index_single_image(
+    tokens: &[u32],
+    image_token_id: u32,
+    grid: (i32, i32, i32),
+    merge: i32,
+) -> (Vec<(i64, i64, i64)>, i64) {
+    let (gt, gh, gw) = grid;
+    let (lt, lh, lw) = (gt as i64, (gh / merge) as i64, (gw / merge) as i64);
+    let advance = (gh.max(gw) / merge) as i64;
+    let mut positions = Vec::with_capacity(tokens.len());
+    let mut cur: i64 = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == image_token_id {
+            for tt in 0..lt {
+                for hh in 0..lh {
+                    for ww in 0..lw {
+                        positions.push((cur + tt, cur + hh, cur + ww));
+                    }
+                }
+            }
+            i += (lt * lh * lw) as usize;
+            cur += advance;
+        } else {
+            positions.push((cur, cur, cur));
+            cur += 1;
+            i += 1;
+        }
+    }
+    (positions, cur)
+}
+
+/// Interleaved M-RoPE cos/sin `[seq, rotary_dim]` (f32) for the given per-token
+/// 3D positions. Frequency index `i` (`0..rotary_dim/2`) rotates axis T/H/W by
+/// `i % 3` (mrope_interleaved, sections [11,11,10] for rotary_dim=64 → 11+11+10).
+pub fn mrope_cos_sin(
+    positions: &[(i64, i64, i64)],
+    rotary_dim: i32,
+    theta: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n_freq = (rotary_dim / 2) as usize;
+    let inv_freq: Vec<f32> = (0..n_freq)
+        .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / rotary_dim as f32))
+        .collect();
+    let rd = rotary_dim as usize;
+    let seq = positions.len();
+    let mut cos = vec![0f32; seq * rd];
+    let mut sin = vec![0f32; seq * rd];
+    for (p, &(pt, ph, pw)) in positions.iter().enumerate() {
+        let base = p * rd;
+        for i in 0..n_freq {
+            let axis_pos = match i % 3 {
+                0 => pt,
+                1 => ph,
+                _ => pw,
+            };
+            let f = axis_pos as f32 * inv_freq[i];
+            let (c, s) = (f.cos(), f.sin());
+            cos[base + i] = c;
+            cos[base + n_freq + i] = c;
+            sin[base + i] = s;
+            sin[base + n_freq + i] = s;
+        }
+    }
+    (cos, sin)
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 

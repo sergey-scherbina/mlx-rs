@@ -21,7 +21,7 @@ use mlx_rs::{
     nn,
     ops::{concatenate_axis, indexing::IndexOp, indexing::NewAxis, split_sections},
     quantization::MaybeQuantized,
-    Array,
+    Array, Dtype,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -83,6 +83,59 @@ pub fn set_batch_pad_offsets(offsets: Option<Array>) {
 /// layers during ragged batched decode. Set before a batched forward; clear it after.
 pub fn set_batch_pad_mask(mask: Option<Array>) {
     BATCH_PAD_MASK.with(|c| *c.borrow_mut() = mask);
+}
+
+thread_local! {
+    /// Multimodal (Qwen3.5-VL) M-RoPE cos/sin `([L, rotary_dim], [L, rotary_dim])`
+    /// (f32) for the current forward. When set, [`Attention::forward`] applies these
+    /// precomputed rotary embeddings to the first `rotary_dim` head dims (partial
+    /// rope) instead of the sequential `self.rope` — the 3D interleaved positions
+    /// (text = sequential, image = grid) are baked in by the caller. OFF by default
+    /// → the text-only path is byte-identical.
+    static MROPE_COSSIN: std::cell::RefCell<Option<(Array, Array)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Multimodal splice: `(image_embeds [n, hidden], start_index)`. When set,
+    /// [`Qwen3_5Model::forward`] replaces the contiguous block of `n` image-token
+    /// embeddings at `[start, start+n)` with the vision-tower output. Set only for
+    /// the (single-pass) multimodal prefill; cleared before decode.
+    static MM_SPLICE: std::cell::RefCell<Option<(Array, i32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set (or clear) the M-RoPE cos/sin for the next forward(s). See [`MROPE_COSSIN`].
+pub fn set_mrope_cossin(v: Option<(Array, Array)>) {
+    MROPE_COSSIN.with(|c| *c.borrow_mut() = v);
+}
+
+/// Set (or clear) the vision-embed splice for the next (prefill) forward. See [`MM_SPLICE`].
+pub fn set_mm_splice(v: Option<(Array, i32)>) {
+    MM_SPLICE.with(|c| *c.borrow_mut() = v);
+}
+
+/// Apply partial interleaved M-RoPE to `x` (`[B, heads, L, head_dim]`) using
+/// precomputed `cos`/`sin` (`[L, rotary_dim]`, f32). Rotates the first
+/// `rotary_dim` dims (NEOX split-half `rotate_half`), passes the rest through.
+fn apply_partial_mrope(x: &Array, cos: &Array, sin: &Array) -> Result<Array, Exception> {
+    let sh = x.shape();
+    let (l, hd) = (sh[2], sh[3]);
+    let rd = cos.shape()[1];
+    let half = rd / 2;
+    let cos = cos.reshape(&[1, 1, l, rd])?;
+    let sin = sin.reshape(&[1, 1, l, rd])?;
+    let x_rot = x.index((.., .., .., 0..rd)).as_dtype(Dtype::Float32)?;
+    let x1 = x_rot.index((.., .., .., 0..half));
+    let x2 = x_rot.index((.., .., .., half..rd));
+    let rot = concatenate_axis(&[&x2.multiply(Array::from_f32(-1.0))?, &x1], -1)?;
+    let rotated = x_rot
+        .multiply(&cos)?
+        .add(&rot.multiply(&sin)?)?
+        .as_dtype(x.dtype())?;
+    if rd == hd {
+        Ok(rotated)
+    } else {
+        let x_pass = x.index((.., .., .., rd..hd));
+        concatenate_axis(&[&rotated, &x_pass], -1)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -281,7 +334,18 @@ impl Attention {
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let (keys, values) = if let Some(cache) = cache {
+        let mrope = MROPE_COSSIN.with(|c| c.borrow().clone());
+        let (keys, values) = if let Some((mcos, msin)) = &mrope {
+            // Multimodal M-RoPE: precomputed 3D-interleaved cos/sin, absolute
+            // positions baked in by the caller (text sequential, image = grid). The
+            // KV-cache offset is irrelevant to rope here.
+            queries = apply_partial_mrope(&queries, mcos, msin)?;
+            keys = apply_partial_mrope(&keys, mcos, msin)?;
+            match cache {
+                Some(cache) => cache.update_and_fetch(keys, values)?,
+                None => (keys, values),
+            }
+        } else if let Some(cache) = cache {
             // Ragged batched decode: rope each row at `cache.offset() − pad_i` (its true
             // position) via the per-row offsets; else the normal shared scalar offset.
             let per_row = BATCH_PAD_OFFSETS.with(|c| {
@@ -745,6 +809,16 @@ impl Qwen3_5Model {
 
     fn forward(&mut self, inputs: &Array, cache: &mut [LayerCache]) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
+        // Multimodal: replace the contiguous image-token embedding block at
+        // `[start, start+n)` with the vision-tower output (single-pass prefill).
+        if let Some((embeds, start)) = MM_SPLICE.with(|c| c.borrow().clone()) {
+            let hidden = h.shape()[2];
+            let n = embeds.shape()[0];
+            let before = h.index((.., 0..start, ..));
+            let after = h.index((.., (start + n).., ..));
+            let emb = embeds.reshape(&[1, n, hidden])?.as_dtype(h.dtype())?;
+            h = concatenate_axis(&[&before, &emb, &after], 1)?;
+        }
         let t = h.shape()[1];
         // Prefill (T>1) uses fused causal SDPA; decode (T==1) needs no mask. MLX's
         // causal mode handles the KV-cache offset (queries align to the last T keys),
