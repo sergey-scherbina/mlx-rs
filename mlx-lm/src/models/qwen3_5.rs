@@ -112,6 +112,25 @@ pub fn set_mm_splice(v: Option<(Array, i32)>) {
     MM_SPLICE.with(|c| *c.borrow_mut() = v);
 }
 
+/// Apply the pending vision-embed splice (see [`set_mm_splice`]) to the embedding
+/// tensor `h` (`[B, L, hidden]`): replace the contiguous `[start, start+n)` image-token
+/// block with the vision-tower output. No-op (returns `h` unchanged) when none is set.
+/// Shared by the dense (`qwen3_5`) and MoE (`qwen3_5_moe`) models so a VLM checkpoint of
+/// either arch splices identically.
+pub fn apply_mm_splice(h: &Array) -> Result<Array, Exception> {
+    match MM_SPLICE.with(|c| c.borrow().clone()) {
+        Some((embeds, start)) => {
+            let hidden = h.shape()[2];
+            let n = embeds.shape()[0];
+            let before = h.index((.., 0..start, ..));
+            let after = h.index((.., (start + n).., ..));
+            let emb = embeds.reshape(&[1, n, hidden])?.as_dtype(h.dtype())?;
+            concatenate_axis(&[&before, &emb, &after], 1)
+        }
+        None => Ok(h.clone()),
+    }
+}
+
 /// Apply partial interleaved M-RoPE to `x` (`[B, heads, L, head_dim]`) using
 /// precomputed `cos`/`sin` (`[L, rotary_dim]`, f32). Rotates the first
 /// `rotary_dim` dims (NEOX split-half `rotate_half`), passes the rest through.
@@ -809,16 +828,9 @@ impl Qwen3_5Model {
 
     fn forward(&mut self, inputs: &Array, cache: &mut [LayerCache]) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
-        // Multimodal: replace the contiguous image-token embedding block at
-        // `[start, start+n)` with the vision-tower output (single-pass prefill).
-        if let Some((embeds, start)) = MM_SPLICE.with(|c| c.borrow().clone()) {
-            let hidden = h.shape()[2];
-            let n = embeds.shape()[0];
-            let before = h.index((.., 0..start, ..));
-            let after = h.index((.., (start + n).., ..));
-            let emb = embeds.reshape(&[1, n, hidden])?.as_dtype(h.dtype())?;
-            h = concatenate_axis(&[&before, &emb, &after], 1)?;
-        }
+        // Multimodal: splice the vision-tower output onto the image-token block
+        // (single-pass prefill). Shared with the MoE model via `apply_mm_splice`.
+        h = apply_mm_splice(&h)?;
         let t = h.shape()[1];
         // Prefill (T>1) uses fused causal SDPA; decode (T==1) needs no mask. MLX's
         // causal mode handles the KV-cache offset (queries align to the last T keys),
@@ -1177,6 +1189,15 @@ impl MmContext {
             decode_step: 0,
         }
     }
+
+    /// `(scalar_position, rotary_dim, theta)` for the NEXT decode step; advances the
+    /// internal step counter. Used by both the dense and MoE `Generate` decode loops to
+    /// build this step's scalar-position M-RoPE (all three axes equal for generated text).
+    pub fn next_decode_step(&mut self) -> (i64, i32, f32) {
+        let pos = self.next_pos + self.decode_step;
+        self.decode_step += 1;
+        (pos, self.rotary_dim, self.theta)
+    }
 }
 
 enum GenState<'a> {
@@ -1331,11 +1352,7 @@ impl Iterator for Generate<'_> {
                 l
             }
             }
-        } else if let Some((pos, rd, theta)) = self.mm.as_mut().map(|mm| {
-            let pos = mm.next_pos + mm.decode_step;
-            mm.decode_step += 1;
-            (pos, mm.rotary_dim, mm.theta)
-        }) {
+        } else if let Some((pos, rd, theta)) = self.mm.as_mut().map(|mm| mm.next_decode_step()) {
             // Multimodal decode: install this step's scalar-position M-RoPE.
             let (dc, ds) =
                 crate::models::qwen3_5_vision::mrope_cos_sin(&[(pos, pos, pos)], rd, theta);

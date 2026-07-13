@@ -358,6 +358,9 @@ impl Qwen3_5MoeModel {
 
     fn forward(&mut self, inputs: &Array, cache: &mut [LayerCache]) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
+        // Multimodal (Qwen3.5-VL MoE, e.g. Qwen3.6-35B): splice the vision-tower output
+        // onto the image-token block. Shared with the dense model via `apply_mm_splice`.
+        h = crate::models::qwen3_5::apply_mm_splice(&h)?;
         let t = h.shape()[1];
         // Prefill uses fused causal SDPA; decode (T==1) needs no mask. See qwen3_5.
         let causal = t > 1;
@@ -604,6 +607,10 @@ pub struct Generate<'a> {
     prefill_snapshot: Option<Vec<LinearSnap>>,
     /// Trailing generation-prompt length; the snapshot is taken before it (qwen3_5).
     gen_prompt_len: i32,
+    /// Multimodal (Qwen3.5-VL MoE) context — see qwen3_5::MmContext. Present for VLM
+    /// checkpoints of the MoE arch (e.g. Qwen3.6-35B-A3B). Single-pass mm prefill
+    /// (splice + prompt M-RoPE, no chunk/reuse) + per-decode-step scalar-position M-RoPE.
+    mm: Option<crate::models::qwen3_5::MmContext>,
 }
 
 enum GenState<'a> {
@@ -634,12 +641,19 @@ impl<'a> Generate<'a> {
             should_cancel: Box::new(|| false),
             prefill_snapshot: None,
             gen_prompt_len: 0,
+            mm: None,
         }
     }
 
     /// Set the trailing generation-prompt length (snapshot at the conv boundary).
     pub fn set_gen_prompt_len(&mut self, n: i32) {
         self.gen_prompt_len = n.max(0);
+    }
+
+    /// Attach multimodal context (vision splice + M-RoPE). Single-pass prefill, no
+    /// prefix reuse. Mirror of qwen3_5::Generate::set_mm_context.
+    pub fn set_mm_context(&mut self, mm: crate::models::qwen3_5::MmContext) {
+        self.mm = Some(mm);
     }
 
     /// Consume the iterator, returning the advanced cache + the conversation-boundary
@@ -678,6 +692,24 @@ impl Iterator for Generate<'_> {
             GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
         let logits = if is_prefill {
+            if let Some((embeds, start, pcos, psin)) = self.mm.as_ref().map(|mm| {
+                (
+                    mm.img_embeds.clone(),
+                    mm.img_start,
+                    mm.prompt_cos.clone(),
+                    mm.prompt_sin.clone(),
+                )
+            }) {
+                // Multimodal: single-pass prefill with vision splice + prompt M-RoPE
+                // (no chunking / prefix reuse). Mirror of qwen3_5::Generate.
+                crate::models::qwen3_5::set_mm_splice(Some((embeds, start)));
+                crate::models::qwen3_5::set_mrope_cossin(Some((pcos, psin)));
+                let l = self.model.forward(&inputs, &mut self.cache);
+                crate::models::qwen3_5::set_mm_splice(None);
+                crate::models::qwen3_5::set_mrope_cossin(None);
+                self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
+                tri!(l)
+            } else {
             // Snapshot the Linear state at the conversation boundary (prompt len −
             // gen_prompt_len), not the very end — see qwen3_5 for the rationale.
             let chunk = crate::models::qwen3_5::prefill_chunk_size();
@@ -715,6 +747,18 @@ impl Iterator for Generate<'_> {
                     Some(self.cache.iter().map(|c| c.snapshot()).collect());
                 l
             }
+            }
+        } else if let Some((pos, rd, theta)) = self.mm.as_mut().map(|mm| mm.next_decode_step()) {
+            // Multimodal decode: install this step's scalar-position M-RoPE.
+            let (dc, ds) =
+                crate::models::qwen3_5_vision::mrope_cos_sin(&[(pos, pos, pos)], rd, theta);
+            crate::models::qwen3_5::set_mrope_cossin(Some((
+                Array::from_slice(&dc, &[1, rd]),
+                Array::from_slice(&ds, &[1, rd]),
+            )));
+            let l = self.model.forward(&inputs, &mut self.cache);
+            crate::models::qwen3_5::set_mrope_cossin(None);
+            tri!(l)
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
