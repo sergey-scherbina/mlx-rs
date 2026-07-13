@@ -12,7 +12,6 @@ use mlx_lm::models::qwen3_5::{self, Model};
 use mlx_lm::models::qwen3_5_vision::{
     load_vision_tower, mrope_cos_sin, patchify_normalize, rope_index_single_image, smart_resize,
 };
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use tokenizers::Tokenizer;
 
@@ -21,22 +20,6 @@ const IM_END_ID: u32 = 151645; // <|im_end|> (fallback stop; resolved from token
 const ROTARY_DIM: i32 = 64; // head_dim(256) * partial_rotary_factor(0.25)
 const ROPE_THETA: f32 = 10_000_000.0;
 const SPATIAL_MERGE: i32 = 2;
-
-fn argmax_last(logits: &Array) -> Result<u32, Box<dyn std::error::Error>> {
-    // logits: [1, L, vocab] -> last position -> host argmax
-    let last = logits.index((.., -1, ..)).as_dtype(mlx_rs::Dtype::Float32)?;
-    last.eval()?;
-    let data = last.as_slice::<f32>();
-    let mut best = 0usize;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &v) in data.iter().enumerate() {
-        if v > bv {
-            bv = v;
-            best = i;
-        }
-    }
-    Ok(best as u32)
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
@@ -100,43 +83,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- 3D M-RoPE positions ---
-    let (positions, mut next_pos) =
+    let (positions, next_pos) =
         rope_index_single_image(&tokens, IMAGE_TOKEN_ID, grid, SPATIAL_MERGE);
     let (cos, sin) = mrope_cos_sin(&positions, ROTARY_DIM, ROPE_THETA);
     let seq = tokens.len() as i32;
     let cos_a = Array::from_slice(&cos, &[seq, ROTARY_DIM]);
     let sin_a = Array::from_slice(&sin, &[seq, ROTARY_DIM]);
 
-    // --- prefill (single pass) with splice + mrope ---
-    let mut cache = model.init_cache();
+    // --- generate via the mm-aware Generate iterator (the path rozum-mlx uses) ---
     let input_ids: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
     let inp = Array::from_slice(&input_ids, &[1, seq]);
-    qwen3_5::set_mm_splice(Some((img_embeds.clone(), img_start)));
-    qwen3_5::set_mrope_cossin(Some((cos_a, sin_a)));
-    let logits = model.forward(&inp, &mut cache)?;
-    qwen3_5::set_mm_splice(None);
-    let mut next = argmax_last(&logits)?;
-    qwen3_5::set_mrope_cossin(None);
-
-    // --- greedy decode ---
+    let mm = qwen3_5::MmContext::new(
+        img_embeds.clone(),
+        img_start,
+        cos_a,
+        sin_a,
+        next_pos,
+        ROTARY_DIM,
+        ROPE_THETA,
+    );
+    let mut g = qwen3_5::Generate::new(&mut model, 0.0, &inp);
+    g.set_mm_context(mm);
     print!("\n=== ANSWER ===\n");
     let mut out_ids: Vec<u32> = Vec::new();
     for _ in 0..128 {
-        if next == im_end {
-            break;
+        match g.next() {
+            Some(Ok(y)) => {
+                y.eval()?;
+                let id = y.as_slice::<u32>()[0];
+                if id == im_end {
+                    break;
+                }
+                out_ids.push(id);
+            }
+            Some(Err(e)) => return Err(Box::new(e)),
+            None => break,
         }
-        out_ids.push(next);
-        // next token position (all axes equal for generated text)
-        let (dcos, dsin) = mrope_cos_sin(&[(next_pos, next_pos, next_pos)], ROTARY_DIM, ROPE_THETA);
-        next_pos += 1;
-        qwen3_5::set_mrope_cossin(Some((
-            Array::from_slice(&dcos, &[1, ROTARY_DIM]),
-            Array::from_slice(&dsin, &[1, ROTARY_DIM]),
-        )));
-        let step_in = Array::from_slice(&[next as i32], &[1, 1]);
-        let logits = model.forward(&step_in, &mut cache)?;
-        qwen3_5::set_mrope_cossin(None);
-        next = argmax_last(&logits)?;
     }
     let text = tok.decode(&out_ids, true).unwrap_or_default();
     println!("{text}");

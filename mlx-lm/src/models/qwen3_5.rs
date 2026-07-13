@@ -1134,6 +1134,49 @@ pub struct Generate<'a> {
     /// tokens, so the snapshot offset matches the reuse boundary. 0 → snapshot at the
     /// very end (the whole prompt recurs).
     gen_prompt_len: i32,
+    /// Multimodal (Qwen3.5-VL) context. When present the prefill is single-pass
+    /// (no chunk/prefix-reuse) with the vision-embed splice + precomputed prompt
+    /// M-RoPE, and each decode step installs its own scalar-position M-RoPE.
+    mm: Option<MmContext>,
+}
+
+/// Per-request vision context threaded through [`Generate`]. Built by the host
+/// (rozum-mlx): the vision-tower embeds, where the contiguous image-token block
+/// starts, the precomputed prompt M-RoPE cos/sin, and the rope params + base
+/// position for the decode steps.
+pub struct MmContext {
+    pub img_embeds: Array,
+    pub img_start: i32,
+    pub prompt_cos: Array,
+    pub prompt_sin: Array,
+    pub next_pos: i64,
+    pub rotary_dim: i32,
+    pub theta: f32,
+    decode_step: i64,
+}
+
+impl MmContext {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        img_embeds: Array,
+        img_start: i32,
+        prompt_cos: Array,
+        prompt_sin: Array,
+        next_pos: i64,
+        rotary_dim: i32,
+        theta: f32,
+    ) -> Self {
+        Self {
+            img_embeds,
+            img_start,
+            prompt_cos,
+            prompt_sin,
+            next_pos,
+            rotary_dim,
+            theta,
+            decode_step: 0,
+        }
+    }
 }
 
 enum GenState<'a> {
@@ -1166,7 +1209,14 @@ impl<'a> Generate<'a> {
             should_cancel: Box::new(|| false),
             prefill_snapshot: None,
             gen_prompt_len: 0,
+            mm: None,
         }
+    }
+
+    /// Attach multimodal context (vision splice + M-RoPE). Disables prefix reuse
+    /// and chunked prefill for this request (single-pass prefill).
+    pub fn set_mm_context(&mut self, mm: MmContext) {
+        self.mm = Some(mm);
     }
 
     /// Set the trailing generation-prompt length so the prefill snapshots the Linear
@@ -1224,6 +1274,24 @@ impl Iterator for Generate<'_> {
         // the trailing generation prompt doesn't recur next turn. So prefill the
         // conversation part, snapshot, then prefill the (tiny) generation-prompt tail.
         let logits = if is_prefill {
+            if let Some((embeds, start, pcos, psin)) = self.mm.as_ref().map(|mm| {
+                (
+                    mm.img_embeds.clone(),
+                    mm.img_start,
+                    mm.prompt_cos.clone(),
+                    mm.prompt_sin.clone(),
+                )
+            }) {
+                // Multimodal: single-pass prefill with vision splice + prompt M-RoPE
+                // (no chunking / prefix reuse).
+                set_mm_splice(Some((embeds, start)));
+                set_mrope_cossin(Some((pcos, psin)));
+                let l = self.model.forward(&inputs, &mut self.cache);
+                set_mm_splice(None);
+                set_mrope_cossin(None);
+                self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
+                tri!(l)
+            } else {
             let t = inputs.shape()[1];
             let split = t - self.gen_prompt_len;
             if self.gen_prompt_len > 0 && split >= 0 && split < t {
@@ -1262,6 +1330,22 @@ impl Iterator for Generate<'_> {
                     Some(self.cache.iter().map(|c| c.snapshot()).collect());
                 l
             }
+            }
+        } else if let Some((pos, rd, theta)) = self.mm.as_mut().map(|mm| {
+            let pos = mm.next_pos + mm.decode_step;
+            mm.decode_step += 1;
+            (pos, mm.rotary_dim, mm.theta)
+        }) {
+            // Multimodal decode: install this step's scalar-position M-RoPE.
+            let (dc, ds) =
+                crate::models::qwen3_5_vision::mrope_cos_sin(&[(pos, pos, pos)], rd, theta);
+            set_mrope_cossin(Some((
+                Array::from_slice(&dc, &[1, rd]),
+                Array::from_slice(&ds, &[1, rd]),
+            )));
+            let l = self.model.forward(&inputs, &mut self.cache);
+            set_mrope_cossin(None);
+            tri!(l)
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
