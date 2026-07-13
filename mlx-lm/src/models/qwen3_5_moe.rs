@@ -692,19 +692,23 @@ impl Iterator for Generate<'_> {
             GenState::Decode(y) => (y.index((.., NewAxis)), false),
         };
         let logits = if is_prefill {
-            if let Some((embeds, start, pcos, psin)) = self.mm.as_ref().map(|mm| {
-                (
-                    mm.img_embeds.clone(),
-                    mm.img_start,
-                    mm.prompt_cos.clone(),
-                    mm.prompt_sin.clone(),
-                )
-            }) {
-                // Multimodal: single-pass prefill with vision splice + prompt M-RoPE
-                // (no chunking / prefix reuse). Mirror of qwen3_5::Generate.
-                crate::models::qwen3_5::set_mm_splice(Some((embeds, start)));
+            if let Some((splice, pcos, psin)) = self
+                .mm
+                .as_ref()
+                .map(|mm| (mm.splice.clone(), mm.prompt_cos.clone(), mm.prompt_sin.clone()))
+            {
+                // Multimodal: single-pass prefill with vision splice(s) + prompt M-RoPE
+                // (no chunking / prefix reuse). Mirror of qwen3_5::Generate. Project only
+                // the LAST position — the image-padded positions never feed the vocab head.
+                crate::models::qwen3_5::set_mm_splice(Some(splice));
                 crate::models::qwen3_5::set_mrope_cossin(Some((pcos, psin)));
-                let l = self.model.forward(&inputs, &mut self.cache);
+                let l = match self.model.model.forward(&inputs, &mut self.cache) {
+                    Ok(h) => {
+                        let last = h.index((.., -1.., ..));
+                        self.model.project(&last)
+                    }
+                    Err(e) => Err(e),
+                };
                 crate::models::qwen3_5::set_mm_splice(None);
                 crate::models::qwen3_5::set_mrope_cossin(None);
                 self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());

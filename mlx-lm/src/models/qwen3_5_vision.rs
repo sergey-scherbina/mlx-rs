@@ -435,14 +435,34 @@ pub fn rope_index_single_image(
     grid: (i32, i32, i32),
     merge: i32,
 ) -> (Vec<(i64, i64, i64)>, i64) {
-    let (gt, gh, gw) = grid;
-    let (lt, lh, lw) = (gt as i64, (gh / merge) as i64, (gw / merge) as i64);
-    let advance = (gh.max(gw) / merge) as i64;
+    rope_index(tokens, image_token_id, std::slice::from_ref(&grid), merge)
+}
+
+/// 3D M-RoPE positions for a prompt containing zero or more images. Text tokens get
+/// scalar positions `(p, p, p)`; each contiguous run of `image_token_id` consumes the
+/// next `grid` (in prompt order) and lays out `(t, h, w)` positions over its
+/// llm-grid, then text resumes at `cur + max(llm_t, llm_h, llm_w)` (Qwen M-RoPE:
+/// the next position is one past the image block's largest axis coordinate).
+/// Returns `(positions, next_pos)` where `next_pos` seeds decode. `grids` must have
+/// one entry per image run, in the order the runs appear.
+pub fn rope_index(
+    tokens: &[u32],
+    image_token_id: u32,
+    grids: &[(i32, i32, i32)],
+    merge: i32,
+) -> (Vec<(i64, i64, i64)>, i64) {
     let mut positions = Vec::with_capacity(tokens.len());
     let mut cur: i64 = 0;
+    let mut gi = 0;
     let mut i = 0;
     while i < tokens.len() {
         if tokens[i] == image_token_id {
+            // Fall back to a 1x1x1 block if the caller under-supplied grids, so a
+            // grid/run mismatch degrades to scalar positions rather than panicking.
+            let (gt, gh, gw) = grids.get(gi).copied().unwrap_or((1, merge, merge));
+            gi += 1;
+            let (lt, lh, lw) = (gt as i64, (gh / merge) as i64, (gw / merge) as i64);
+            let advance = lt.max((gh / merge) as i64).max((gw / merge) as i64);
             for tt in 0..lt {
                 for hh in 0..lh {
                     for ww in 0..lw {
@@ -579,7 +599,16 @@ pub fn patchify_normalize(
 
 /// Load the vision tower from a multimodal Qwen3.5 checkpoint dir. Reads only the
 /// `vision_tower.*` weights (reshaping the patch-embed conv weight to the Linear
-/// layout). bf16 checkpoint expected (no quantization on the vision tower yet).
+/// layout).
+///
+/// The tower is loaded in the checkpoint dtype (bf16 in every mlx-community VL quant
+/// to date — mlx-vlm keeps the vision encoder high-precision even when the LM is 4/8-bit,
+/// so a "4-bit" checkpoint still ships a bf16 tower). A genuinely *quantized* tower
+/// (`vision_tower.*.scales` / `.biases` present) is detected and rejected with a clear
+/// error rather than silently loading garbage — [`VisionModel`] uses plain `Linear`
+/// layers, so it cannot consume packed quant weights. No such checkpoint exists yet; add
+/// `MaybeQuantized` wrapping here if one appears. Likewise, matching *zero* vision weights
+/// (wrong key layout / a text-only checkpoint) is an error, not a silently random tower.
 pub fn load_vision_tower(model_dir: impl AsRef<Path>) -> Result<VisionModel, Error> {
     let model_dir = model_dir.as_ref();
     let text = std::fs::read_to_string(model_dir.join("config.json"))?;
@@ -592,16 +621,23 @@ pub fn load_vision_tower(model_dir: impl AsRef<Path>) -> Result<VisionModel, Err
         model: &mut VisionModel,
         file: &Path,
         patch_in: i32,
-    ) -> Result<usize, Error> {
+    ) -> Result<(usize, bool), Error> {
         let loaded = mlx_rs::Array::load_safetensors(file)?;
         let mut params = model.parameters_mut().flatten();
         let param_keys: HashSet<String> = params.keys().map(|k| k.to_string()).collect();
         let mut matched = 0usize;
+        let mut quantized = false;
         for (key, mut value) in loaded {
             let key = match key.strip_prefix("vision_tower.") {
                 Some(k) => k.to_string(),
                 None => continue, // text / other weights: skip
             };
+            // A quantized Linear stores packed `.weight` alongside `.scales`/`.biases`
+            // — presence of the latter under vision_tower means the tower is quantized.
+            if key.ends_with(".scales") || key.ends_with(".biases") {
+                quantized = true;
+                continue;
+            }
             // patch-embed conv weight. The mlx-community checkpoint stores it
             // channels-LAST: [out, T, ph, pw, C]. The pixel_values (and the
             // reference conv) are channels-FIRST [C, T, ph, pw], so move C from
@@ -619,11 +655,12 @@ pub fn load_vision_tower(model_dir: impl AsRef<Path>) -> Result<VisionModel, Err
                 matched += 1;
             }
         }
-        Ok(matched)
+        Ok((matched, quantized))
     }
 
     let weights_index = model_dir.join("model.safetensors.index.json");
     let mut matched = 0usize;
+    let mut quantized = false;
     if weights_index.exists() {
         let json = std::fs::read_to_string(weights_index)?;
         let map: serde_json::Value = serde_json::from_str(&json)?;
@@ -633,11 +670,27 @@ pub fn load_vision_tower(model_dir: impl AsRef<Path>) -> Result<VisionModel, Err
             .map(|o| o.values().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
         for f in files {
-            matched += load_shard(&mut model, &model_dir.join(f), patch_in)?;
+            let (m, q) = load_shard(&mut model, &model_dir.join(f), patch_in)?;
+            matched += m;
+            quantized |= q;
         }
     } else {
         let single = model_dir.join("model.safetensors");
-        matched += load_shard(&mut model, &single, patch_in)?;
+        let (m, q) = load_shard(&mut model, &single, patch_in)?;
+        matched += m;
+        quantized |= q;
+    }
+    if quantized {
+        return Err(Error::from(mlx_rs::error::Exception::from(
+            "quantized vision tower is not supported (VisionModel uses dense Linear layers); \
+             use a checkpoint whose vision_tower weights are bf16/f16",
+        )));
+    }
+    if matched == 0 {
+        return Err(Error::from(mlx_rs::error::Exception::from(
+            "no vision_tower.* weights found in checkpoint (text-only checkpoint, or an \
+             unexpected key layout) — refusing to run a randomly-initialised vision tower",
+        )));
     }
     if std::env::var("ROZUM_MLX_DEBUG").is_ok() {
         eprintln!("LOADED {matched} vision params (qwen3_5_vision)");

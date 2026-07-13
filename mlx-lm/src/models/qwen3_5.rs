@@ -94,11 +94,14 @@ thread_local! {
     /// → the text-only path is byte-identical.
     static MROPE_COSSIN: std::cell::RefCell<Option<(Array, Array)>> =
         const { std::cell::RefCell::new(None) };
-    /// Multimodal splice: `(image_embeds [n, hidden], start_index)`. When set,
-    /// [`Qwen3_5Model::forward`] replaces the contiguous block of `n` image-token
-    /// embeddings at `[start, start+n)` with the vision-tower output. Set only for
-    /// the (single-pass) multimodal prefill; cleared before decode.
-    static MM_SPLICE: std::cell::RefCell<Option<(Array, i32)>> =
+    /// Multimodal splice: one `(image_embeds [n, hidden], start_index)` per image.
+    /// When set, [`Qwen3_5Model::forward`] replaces each contiguous block of `n`
+    /// image-token embeddings at `[start, start+n)` with that image's vision-tower
+    /// output. Blocks are non-overlapping and same-length replacements (the image-pad
+    /// tokens are pre-expanded to `n` per image by the caller), so multiple images
+    /// splice independently without shifting each other's indices. Set only for the
+    /// (single-pass) multimodal prefill; cleared before decode.
+    static MM_SPLICE: std::cell::RefCell<Option<Vec<(Array, i32)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -107,28 +110,41 @@ pub fn set_mrope_cossin(v: Option<(Array, Array)>) {
     MROPE_COSSIN.with(|c| *c.borrow_mut() = v);
 }
 
-/// Set (or clear) the vision-embed splice for the next (prefill) forward. See [`MM_SPLICE`].
-pub fn set_mm_splice(v: Option<(Array, i32)>) {
+/// Set (or clear) the vision-embed splice(s) for the next (prefill) forward. See [`MM_SPLICE`].
+pub fn set_mm_splice(v: Option<Vec<(Array, i32)>>) {
     MM_SPLICE.with(|c| *c.borrow_mut() = v);
 }
 
-/// Apply the pending vision-embed splice (see [`set_mm_splice`]) to the embedding
-/// tensor `h` (`[B, L, hidden]`): replace the contiguous `[start, start+n)` image-token
-/// block with the vision-tower output. No-op (returns `h` unchanged) when none is set.
-/// Shared by the dense (`qwen3_5`) and MoE (`qwen3_5_moe`) models so a VLM checkpoint of
-/// either arch splices identically.
+/// Apply the pending vision-embed splice(s) (see [`set_mm_splice`]) to the embedding
+/// tensor `h` (`[B, L, hidden]`): for each image, replace its contiguous `[start, start+n)`
+/// image-token block with that image's vision-tower output. No-op (returns `h` unchanged)
+/// when none is set. Blocks are sorted by start and stitched in one pass; because each is a
+/// same-length replacement they do not shift one another. Shared by the dense (`qwen3_5`)
+/// and MoE (`qwen3_5_moe`) models so a VLM checkpoint of either arch splices identically.
 pub fn apply_mm_splice(h: &Array) -> Result<Array, Exception> {
-    match MM_SPLICE.with(|c| c.borrow().clone()) {
-        Some((embeds, start)) => {
-            let hidden = h.shape()[2];
-            let n = embeds.shape()[0];
-            let before = h.index((.., 0..start, ..));
-            let after = h.index((.., (start + n).., ..));
-            let emb = embeds.reshape(&[1, n, hidden])?.as_dtype(h.dtype())?;
-            concatenate_axis(&[&before, &emb, &after], 1)
-        }
-        None => Ok(h.clone()),
+    let blocks = MM_SPLICE.with(|c| c.borrow().clone());
+    let Some(mut blocks) = blocks else { return Ok(h.clone()) };
+    if blocks.is_empty() {
+        return Ok(h.clone());
     }
+    blocks.sort_by_key(|(_, s)| *s);
+    let hidden = h.shape()[2];
+    let total = h.shape()[1];
+    let mut parts: Vec<Array> = Vec::with_capacity(blocks.len() * 2 + 1);
+    let mut cur: i32 = 0;
+    for (embeds, start) in &blocks {
+        let n = embeds.shape()[0];
+        if *start > cur {
+            parts.push(h.index((.., cur..*start, ..)));
+        }
+        parts.push(embeds.reshape(&[1, n, hidden])?.as_dtype(h.dtype())?);
+        cur = start + n;
+    }
+    if cur < total {
+        parts.push(h.index((.., cur..total, ..)));
+    }
+    let refs: Vec<&Array> = parts.iter().collect();
+    concatenate_axis(&refs, 1)
 }
 
 /// Apply partial interleaved M-RoPE to `x` (`[B, heads, L, head_dim]`) using
@@ -1157,8 +1173,8 @@ pub struct Generate<'a> {
 /// starts, the precomputed prompt M-RoPE cos/sin, and the rope params + base
 /// position for the decode steps.
 pub struct MmContext {
-    pub img_embeds: Array,
-    pub img_start: i32,
+    /// One `(image_embeds [n, hidden], start_index)` per image, in prompt order.
+    pub splice: Vec<(Array, i32)>,
     pub prompt_cos: Array,
     pub prompt_sin: Array,
     pub next_pos: i64,
@@ -1170,8 +1186,7 @@ pub struct MmContext {
 impl MmContext {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        img_embeds: Array,
-        img_start: i32,
+        splice: Vec<(Array, i32)>,
         prompt_cos: Array,
         prompt_sin: Array,
         next_pos: i64,
@@ -1179,8 +1194,7 @@ impl MmContext {
         theta: f32,
     ) -> Self {
         Self {
-            img_embeds,
-            img_start,
+            splice,
             prompt_cos,
             prompt_sin,
             next_pos,
@@ -1295,19 +1309,24 @@ impl Iterator for Generate<'_> {
         // the trailing generation prompt doesn't recur next turn. So prefill the
         // conversation part, snapshot, then prefill the (tiny) generation-prompt tail.
         let logits = if is_prefill {
-            if let Some((embeds, start, pcos, psin)) = self.mm.as_ref().map(|mm| {
-                (
-                    mm.img_embeds.clone(),
-                    mm.img_start,
-                    mm.prompt_cos.clone(),
-                    mm.prompt_sin.clone(),
-                )
-            }) {
-                // Multimodal: single-pass prefill with vision splice + prompt M-RoPE
-                // (no chunking / prefix reuse).
-                set_mm_splice(Some((embeds, start)));
+            if let Some((splice, pcos, psin)) = self
+                .mm
+                .as_ref()
+                .map(|mm| (mm.splice.clone(), mm.prompt_cos.clone(), mm.prompt_sin.clone()))
+            {
+                // Multimodal: single-pass prefill with vision splice(s) + prompt M-RoPE
+                // (no chunking / prefix reuse). Project only the LAST position — the
+                // vision-token positions never feed the vocab head, so running the big
+                // `lm_head` on the whole (image-padded) prompt is pure waste.
+                set_mm_splice(Some(splice));
                 set_mrope_cossin(Some((pcos, psin)));
-                let l = self.model.forward(&inputs, &mut self.cache);
+                let l = match self.model.model.forward(&inputs, &mut self.cache) {
+                    Ok(h) => {
+                        let last = h.index((.., -1.., ..));
+                        self.model.project(&last)
+                    }
+                    Err(e) => Err(e),
+                };
                 set_mm_splice(None);
                 set_mrope_cossin(None);
                 self.prefill_snapshot = Some(self.cache.iter().map(|c| c.snapshot()).collect());
