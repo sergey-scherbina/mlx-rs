@@ -9,7 +9,9 @@
 //!       <model_dir> <pixel_values.safetensors> <t> <h> <w> [prompt]
 
 use mlx_lm::models::qwen3_5::{self, Model};
-use mlx_lm::models::qwen3_5_vision::{load_vision_tower, mrope_cos_sin, rope_index_single_image};
+use mlx_lm::models::qwen3_5_vision::{
+    load_vision_tower, mrope_cos_sin, patchify_normalize, rope_index_single_image, smart_resize,
+};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use tokenizers::Tokenizer;
@@ -55,10 +57,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tok = Tokenizer::from_file(format!("{model_dir}/tokenizer.json")).map_err(|e| format!("tokenizer load: {e}"))?;
     let im_end = tok.token_to_id("<|im_end|>").unwrap_or(IM_END_ID);
 
+    // --- pixel_values: either a precomputed .safetensors, or decode+preprocess
+    //     a raw image (.jpg/.png) in Rust ---
+    let (pv, grid) = if pv_path.ends_with(".safetensors") {
+        let loaded = mlx_rs::Array::load_safetensors(pv_path)?;
+        let pv = loaded.get("pixel_values").ok_or("missing pixel_values")?.clone();
+        (pv, (t, h, w))
+    } else {
+        let img = image::open(pv_path)?.to_rgb8();
+        let (ow, oh) = (img.width() as i32, img.height() as i32);
+        let (hbar, wbar) = smart_resize(oh, ow, 16 * 2, 65536, 16_777_216);
+        let resized =
+            image::imageops::resize(&img, wbar as u32, hbar as u32, image::imageops::FilterType::CatmullRom);
+        let rgb = resized.into_raw();
+        let (pixels, (gh, gw)) =
+            patchify_normalize(&rgb, hbar, wbar, 16, 2, 2, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
+        eprintln!("preprocessed {ow}x{oh} -> {wbar}x{hbar}, grid 1x{gh}x{gw}");
+        let pv = Array::from_slice(&pixels, &[gh * gw, 1536]);
+        (pv, (1, gh, gw))
+    };
+
     // --- vision features ---
-    let loaded = mlx_rs::Array::load_safetensors(pv_path)?;
-    let pv = loaded.get("pixel_values").ok_or("missing pixel_values")?;
-    let img_embeds = vision.forward(pv, (t, h, w))?; // [n_img, hidden]
+    let img_embeds = vision.forward(&pv, grid)?; // [n_img, hidden]
     img_embeds.eval()?;
     let n_img = img_embeds.shape()[0];
     eprintln!("vision embeds: {:?}", img_embeds.shape());
@@ -81,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 3D M-RoPE positions ---
     let (positions, mut next_pos) =
-        rope_index_single_image(&tokens, IMAGE_TOKEN_ID, (t, h, w), SPATIAL_MERGE);
+        rope_index_single_image(&tokens, IMAGE_TOKEN_ID, grid, SPATIAL_MERGE);
     let (cos, sin) = mrope_cos_sin(&positions, ROTARY_DIM, ROPE_THETA);
     let seq = tokens.len() as i32;
     let cos_a = Array::from_slice(&cos, &[seq, ROTARY_DIM]);

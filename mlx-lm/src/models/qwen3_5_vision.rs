@@ -497,6 +497,83 @@ pub fn mrope_cos_sin(
 }
 
 // ---------------------------------------------------------------------------
+// Image preprocessing (mirror Qwen2VLImageProcessorFast). `smart_resize`
+// computes the target size; the caller decodes + resizes the pixels (bicubic)
+// then `patchify_normalize` produces the flattened patch vectors. The row order
+// is block-major over merge blocks; the column order is [C, temporal, ph, pw]
+// (channels-first) — matching the conv weight after the channels-first remap.
+// ---------------------------------------------------------------------------
+
+/// Qwen2VL `smart_resize`: nearest multiple of `factor` within `[min_px, max_px]`
+/// total pixels, preserving aspect ratio.
+pub fn smart_resize(h: i32, w: i32, factor: i32, min_px: i64, max_px: i64) -> (i32, i32) {
+    let f = factor as f64;
+    let round_by = |x: f64| (((x / f).round() as i32).max(1) * factor).max(factor);
+    let mut hb = round_by(h as f64);
+    let mut wb = round_by(w as f64);
+    let area = hb as i64 * wb as i64;
+    if area > max_px {
+        let beta = ((h as f64 * w as f64) / max_px as f64).sqrt();
+        hb = (((h as f64 / beta) / f).floor() as i32).max(1) * factor;
+        wb = (((w as f64 / beta) / f).floor() as i32).max(1) * factor;
+    } else if area < min_px {
+        let beta = (min_px as f64 / (h as f64 * w as f64)).sqrt();
+        hb = ((h as f64 * beta) / f).ceil() as i32 * factor;
+        wb = ((w as f64 * beta) / f).ceil() as i32 * factor;
+    }
+    (hb, wb)
+}
+
+/// Flatten an already-resized RGB image (`rgb`, HWC, `hbar*wbar*3` bytes) into
+/// normalized patch vectors `[grid_h*grid_w, 3*temporal*patch*patch]`. Returns
+/// `(pixel_values, (grid_h, grid_w))`.
+#[allow(clippy::too_many_arguments)]
+pub fn patchify_normalize(
+    rgb: &[u8],
+    hbar: i32,
+    wbar: i32,
+    patch: i32,
+    merge: i32,
+    temporal: i32,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> (Vec<f32>, (i32, i32)) {
+    let (gh, gw) = (hbar / patch, wbar / patch);
+    let (hbm, wbm) = (gh / merge, gw / merge);
+    let per = (3 * temporal * patch * patch) as usize;
+    let mut out = vec![0f32; (gh * gw) as usize * per];
+    let w = wbar as usize;
+    let mut p = 0usize;
+    for bh in 0..hbm {
+        for bw in 0..wbm {
+            for ih in 0..merge {
+                for iw in 0..merge {
+                    let gr_h = bh * merge + ih;
+                    let gr_w = bw * merge + iw;
+                    let base = p * per;
+                    let mut col = 0usize;
+                    for c in 0..3usize {
+                        for _tt in 0..temporal {
+                            for ph in 0..patch {
+                                for pw in 0..patch {
+                                    let y = (gr_h * patch + ph) as usize;
+                                    let x = (gr_w * patch + pw) as usize;
+                                    let v = rgb[(y * w + x) * 3 + c] as f32 / 255.0;
+                                    out[base + col] = (v - mean[c]) / std[c];
+                                    col += 1;
+                                }
+                            }
+                        }
+                    }
+                    p += 1;
+                }
+            }
+        }
+    }
+    (out, (gh, gw))
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
