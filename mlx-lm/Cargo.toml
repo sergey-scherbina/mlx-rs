@@ -10,6 +10,34 @@ license.workspace = true
 documentation.workspace = true
 description = "Rust implementation of mlx-lm"
 
+# Per-family model features. Additive and ON by default, so existing consumers are unaffected;
+# a consumer that only loads some families builds lean with `default-features = false`.
+# The qwen3/qwen3_5/qwen3_5_vision/gated_delta CORE is always compiled — see src/models/mod.rs
+# for why it cannot be split (qwen3 <-> qwen3_5 are mutually referential; features must be a DAG).
+[features]
+default = ["all-models"]
+all-models = [
+    "deepseek-v2",
+    "gemma3",
+    "glm4",
+    "glm4-moe-lite",
+    "gpt-oss",
+    "llama",
+    "qwen2",
+    "qwen3-moe",
+    "qwen3-5-moe",
+]
+deepseek-v2 = []
+gemma3 = []
+glm4 = []
+glm4-moe-lite = []
+gpt-oss = []
+llama = []
+qwen2 = []
+qwen3-moe = []
+# qwen3_5_moe reuses qwen3_moe's blocks, so it pulls that family in.
+qwen3-5-moe = ["qwen3-moe"]
+
 [dependencies]
 # Local dependencies
 mlx-rs.workspace = true
