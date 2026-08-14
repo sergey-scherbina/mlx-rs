@@ -719,18 +719,39 @@ pub struct SamplerOpts {
     /// Repetition penalty (HF convention: divide positive logits / multiply
     /// negative ones for recently-seen tokens). `1.0` = off.
     pub repeat_penalty: f32,
+    /// OpenAI `frequency_penalty`: subtract `penalty × count(token)` from the
+    /// logit, counted over the whole generated run. `0.0` = off.
+    ///
+    /// A DIFFERENT function from `repeat_penalty`, not a spelling of it:
+    /// additive rather than multiplicative, proportional to how often the token
+    /// was generated rather than flat, and over the whole run rather than a
+    /// recent window. Both can be on at once; they compose.
+    pub frequency_penalty: f32,
+    /// OpenAI `presence_penalty`: subtract `penalty` once from any token that
+    /// has appeared at all, however often. `0.0` = off.
+    pub presence_penalty: f32,
 }
 
 impl SamplerOpts {
-    /// temp only (top_p/top_k/repeat_penalty off) — the historic
-    /// `sample(logits, temp)` behavior.
+    /// temp only (every filter off) — the historic `sample(logits, temp)` behavior.
     pub fn with_temp(temp: f32) -> Self {
         Self {
             temp,
             top_p: 1.0,
             top_k: 0,
             repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
+    }
+
+    /// Does sampling need the generated-token history kept?
+    ///
+    /// One predicate for every model's generator: each of them used to spell
+    /// `repeat_penalty != 1.0` inline, so a new history-dependent knob had to be
+    /// remembered in eleven places or be silently ignored in ten of them.
+    pub fn keeps_history(&self) -> bool {
+        self.repeat_penalty != 1.0 || self.frequency_penalty != 0.0 || self.presence_penalty != 0.0
     }
 }
 
@@ -757,19 +778,68 @@ fn apply_repeat_penalty(logits: &Array, recent: &[u32], penalty: f32) -> Result<
     mlx_rs::ops::indexing::put_along_axis(logits, &idx, &penalized, -1)
 }
 
-/// Sample one token id per row of `logits` (`[B, vocab]`). Applies the repetition
-/// penalty over `recent` (if any), then `temp == 0` is argmax (kept byte-exact for
-/// the oracle tests when no penalty), else top-k -> top-p (nucleus) -> categorical.
-/// Ported from Python `mlx_lm`.
+/// Subtract OpenAI's count-based penalties: `logit -= frequency × count + presence`.
+///
+/// `generated` is the WHOLE run, and the indices are deduplicated before the write —
+/// `put_along_axis` with a repeated index has no defined winner, and the count is exactly what
+/// makes this penalty different from `apply_repeat_penalty` above.
+fn apply_count_penalties(
+    logits: &Array,
+    generated: &[u32],
+    frequency: f32,
+    presence: f32,
+) -> Result<Array, Exception> {
+    let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for &t in generated {
+        *counts.entry(t).or_insert(0.0) += 1.0;
+    }
+    let mut idx_vals: Vec<i32> = Vec::with_capacity(counts.len());
+    let mut pen_vals: Vec<f32> = Vec::with_capacity(counts.len());
+    for (t, n) in counts {
+        idx_vals.push(t as i32);
+        pen_vals.push(frequency * n + presence);
+    }
+    if idx_vals.is_empty() {
+        return Ok(logits.clone());
+    }
+    let n = idx_vals.len() as i32;
+    let idx = Array::from_slice(&idx_vals, &[1, n]);
+    let pen = Array::from_slice(&pen_vals, &[1, n]);
+    let selected = mlx_rs::ops::indexing::take_along_axis(logits, &idx, -1)?; // [1, N]
+    let penalized = selected.subtract(&pen)?;
+    mlx_rs::ops::indexing::put_along_axis(logits, &idx, &penalized, -1)
+}
+
+/// Sample one token id per row of `logits` (`[B, vocab]`). Applies the penalties over
+/// `generated` (if any), then `temp == 0` is argmax (kept byte-exact for the oracle tests when no
+/// penalty), else top-k -> top-p (nucleus) -> categorical. Ported from Python `mlx_lm`.
+///
+/// `generated` is the WHOLE run, not a window: the repetition penalty windows it itself, and
+/// OpenAI's pair counts over all of it. The caller used to choose the slice, so two callers could
+/// disagree about what "recent" meant.
 pub fn sample_with(
     logits: &Array,
     opts: &SamplerOpts,
-    recent: &[u32],
+    generated: &[u32],
 ) -> Result<Array, Exception> {
-    let penalized;
-    let logits = if opts.repeat_penalty != 1.0 && !recent.is_empty() {
-        penalized = apply_repeat_penalty(logits, recent, opts.repeat_penalty)?;
-        &penalized
+    let repeated;
+    let logits = if opts.repeat_penalty != 1.0 && !generated.is_empty() {
+        repeated = apply_repeat_penalty(logits, repeat_window(generated), opts.repeat_penalty)?;
+        &repeated
+    } else {
+        logits
+    };
+    let counted;
+    let logits = if (opts.frequency_penalty != 0.0 || opts.presence_penalty != 0.0)
+        && !generated.is_empty()
+    {
+        counted = apply_count_penalties(
+            logits,
+            generated,
+            opts.frequency_penalty,
+            opts.presence_penalty,
+        )?;
+        &counted
     } else {
         logits
     };
@@ -909,10 +979,19 @@ where
     }
 
     /// Set top-p / top-k / repeat-penalty (temp came from `new`).
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
+    pub fn set_sampler(
+        &mut self,
+        top_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
         self.sampler.repeat_penalty = repeat_penalty;
+        self.sampler.frequency_penalty = frequency_penalty;
+        self.sampler.presence_penalty = presence_penalty;
     }
 }
 
@@ -965,8 +1044,8 @@ where
                     tri!(mlx_rs::transforms::eval(to_eval));
                     start = end;
                 };
-                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-                    repeat_window(&self.history)
+                let recent: &[u32] = if self.sampler.keeps_history() {
+                    &self.history
                 } else {
                     &[]
                 };
@@ -975,7 +1054,7 @@ where
                     &self.sampler,
                     recent
                 ));
-                if self.sampler.repeat_penalty != 1.0 {
+                if self.sampler.keeps_history() {
                     tri!(mlx_rs::transforms::eval([&y]));
                     self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
                 }
@@ -991,13 +1070,13 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-                    repeat_window(&self.history)
+                let recent: &[u32] = if self.sampler.keeps_history() {
+                    &self.history
                 } else {
                     &[]
                 };
                 let y = tri!(sample_with(&logits, &self.sampler, recent));
-                if self.sampler.repeat_penalty != 1.0 {
+                if self.sampler.keeps_history() {
                     tri!(mlx_rs::transforms::eval([&y]));
                     self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
                 }
@@ -1044,6 +1123,8 @@ mod tests {
                     top_p: 1.0,
                     top_k: 1,
                     repeat_penalty: 1.0,
+                    frequency_penalty: 0.0,
+                    presence_penalty: 0.0,
                 },
                 &[],
             )
@@ -1060,6 +1141,8 @@ mod tests {
                 top_p: 1e-4,
                 top_k: 0,
                 repeat_penalty: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
             },
             &[],
         )
@@ -1081,6 +1164,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 repeat_penalty: 100.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
             },
             &[3],
         )
@@ -1190,5 +1275,60 @@ mod tests {
         println!("{s}");
 
         println!("------");
+    }
+}
+
+#[cfg(test)]
+mod penalty_tests {
+    use super::{SamplerOpts, apply_count_penalties};
+    use mlx_rs::Array;
+
+    fn opts(freq: f32, presence: f32, repeat: f32) -> SamplerOpts {
+        SamplerOpts { frequency_penalty: freq, presence_penalty: presence, repeat_penalty: repeat, ..SamplerOpts::with_temp(0.0) }
+    }
+
+    #[test]
+    fn keeps_history_covers_every_knob_that_needs_it() {
+        // One predicate instead of `repeat_penalty != 1.0` spelled inline in eleven generators —
+        // which is exactly why a new history-dependent knob used to be silently ignored in ten of
+        // them.
+        assert!(!opts(0.0, 0.0, 1.0).keeps_history(), "nothing on → no history to keep");
+        assert!(opts(0.0, 0.0, 1.1).keeps_history());
+        assert!(opts(0.5, 0.0, 1.0).keeps_history());
+        assert!(opts(0.0, 0.5, 1.0).keeps_history());
+    }
+
+    #[test]
+    fn frequency_scales_with_the_count_and_presence_does_not() {
+        // logits [0, 0, 0]; token 0 generated three times, token 1 once.
+        let logits = Array::from_slice(&[0.0f32, 0.0, 0.0], &[1, 3]);
+        let generated = [0u32, 0, 0, 1];
+
+        // frequency 1.0: token0 -3.0, token1 -1.0, token2 untouched.
+        let out = apply_count_penalties(&logits, &generated, 1.0, 0.0).expect("freq");
+        let v: Vec<f32> = out.as_slice::<f32>().to_vec();
+        assert_eq!(v, vec![-3.0, -1.0, 0.0]);
+
+        // presence 1.0: both seen tokens -1.0 regardless of how often.
+        let out = apply_count_penalties(&logits, &generated, 0.0, 1.0).expect("presence");
+        let v: Vec<f32> = out.as_slice::<f32>().to_vec();
+        assert_eq!(v, vec![-1.0, -1.0, 0.0]);
+
+        // Both compose: token0 = -(3 × 1.0) - 0.5.
+        let out = apply_count_penalties(&logits, &generated, 1.0, 0.5).expect("both");
+        let v: Vec<f32> = out.as_slice::<f32>().to_vec();
+        assert_eq!(v, vec![-3.5, -1.5, 0.0]);
+    }
+
+    #[test]
+    fn a_repeated_index_is_written_once_not_raced() {
+        // `put_along_axis` has no defined winner for a repeated index, and the COUNT is the whole
+        // point of this penalty — so the indices are deduplicated before the write. Ten copies of
+        // one token must subtract 10 × freq once, not an arbitrary one of ten values.
+        let logits = Array::from_slice(&[0.0f32, 0.0], &[1, 2]);
+        let generated = [1u32; 10];
+        let out = apply_count_penalties(&logits, &generated, 0.25, 0.0).expect("dedup");
+        let v: Vec<f32> = out.as_slice::<f32>().to_vec();
+        assert_eq!(v, vec![0.0, -2.5]);
     }
 }

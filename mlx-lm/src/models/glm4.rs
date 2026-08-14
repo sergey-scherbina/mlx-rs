@@ -37,7 +37,7 @@ use crate::{
     cache::KeyValueCache,
     error::Error,
     // Sampler is model-agnostic (operates on logit arrays) — reuse qwen3's, like qwen2 does.
-    models::qwen3::{repeat_window, sample_with, QuantizationConfig, SamplerOpts},
+    models::qwen3::{sample_with, QuantizationConfig, SamplerOpts},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -618,10 +618,19 @@ where
         }
     }
 
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
+    pub fn set_sampler(
+        &mut self,
+        top_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
         self.sampler.repeat_penalty = repeat_penalty;
+        self.sampler.frequency_penalty = frequency_penalty;
+        self.sampler.presence_penalty = presence_penalty;
     }
 }
 
@@ -654,13 +663,13 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-                    repeat_window(&self.history)
+                let recent: &[u32] = if self.sampler.keeps_history() {
+                    &self.history
                 } else {
                     &[]
                 };
                 let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler, recent));
-                if self.sampler.repeat_penalty != 1.0 {
+                if self.sampler.keeps_history() {
                     tri!(mlx_rs::transforms::eval([&y]));
                     self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
                 }
@@ -675,13 +684,13 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-                    repeat_window(&self.history)
+                let recent: &[u32] = if self.sampler.keeps_history() {
+                    &self.history
                 } else {
                     &[]
                 };
                 let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler, recent));
-                if self.sampler.repeat_penalty != 1.0 {
+                if self.sampler.keeps_history() {
                     tri!(mlx_rs::transforms::eval([&y]));
                     self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
                 }

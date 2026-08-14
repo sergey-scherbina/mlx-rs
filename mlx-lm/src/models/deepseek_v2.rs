@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::{
     cache::KeyValueCache,
     error::Error,
-    models::qwen3::{repeat_window, sample_with, GenerateState, QuantizationConfig, SamplerOpts},
+    models::qwen3::{sample_with, GenerateState, QuantizationConfig, SamplerOpts},
     models::qwen3_moe::SwitchGlu,
     utils::{
         create_attention_mask,
@@ -612,8 +612,19 @@ where
     pub fn new(model: &'a mut Model, cache: &'a mut Vec<Option<C>>, temp: f32, prompt_token: &'a Array) -> Self {
         Self { model, cache, sampler: SamplerOpts::with_temp(temp), history: Vec::new(), state: GenerateState::Prefill { prompt_token } }
     }
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
-        self.sampler.top_p = top_p; self.sampler.top_k = top_k; self.sampler.repeat_penalty = repeat_penalty;
+    pub fn set_sampler(
+        &mut self,
+        top_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) {
+        self.sampler.top_p = top_p;
+        self.sampler.top_k = top_k;
+        self.sampler.repeat_penalty = repeat_penalty;
+        self.sampler.frequency_penalty = frequency_penalty;
+        self.sampler.presence_penalty = presence_penalty;
     }
 }
 impl<C> Iterator for Generate<'_, C>
@@ -628,9 +639,9 @@ where
             GenerateState::Decode { y } => y.index((.., NewAxis)),
         };
         let logits = tri!(self.model.forward(ModelInput { inputs: &inputs, mask: None, cache: self.cache }));
-        let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 { repeat_window(&self.history) } else { &[] };
+        let recent: &[u32] = if self.sampler.keeps_history() { &self.history } else { &[] };
         let y = tri!(sample_with(&logits.index((.., -1, ..)), &self.sampler, recent));
-        if self.sampler.repeat_penalty != 1.0 {
+        if self.sampler.keeps_history() {
             tri!(mlx_rs::transforms::eval([&y]));
             self.history.push(tri!(y.reshape(&[-1])).index(0).item::<u32>());
         }

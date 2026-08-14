@@ -757,10 +757,19 @@ where
         }
     }
 
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
+    pub fn set_sampler(
+        &mut self,
+        top_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
         self.sampler.repeat_penalty = repeat_penalty;
+        self.sampler.frequency_penalty = frequency_penalty;
+        self.sampler.presence_penalty = presence_penalty;
     }
 }
 
@@ -771,7 +780,7 @@ where
     type Item = Result<Array, Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use crate::models::qwen3::{repeat_window, sample_with, GenerateState};
+        use crate::models::qwen3::{sample_with, GenerateState};
         use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 
         macro_rules! tri {
@@ -785,7 +794,7 @@ where
 
         macro_rules! record {
             ($y:expr) => {
-                if self.sampler.repeat_penalty != 1.0 {
+                if self.sampler.keeps_history() {
                     tri!(mlx_rs::transforms::eval([&$y]));
                     self.history
                         .push(tri!($y.reshape(&[-1])).index(0).item::<u32>());
@@ -816,8 +825,8 @@ where
                     tri!(mlx_rs::transforms::eval(to_eval));
                     start = end;
                 };
-                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-                    repeat_window(&self.history)
+                let recent: &[u32] = if self.sampler.keeps_history() {
+                    &self.history
                 } else {
                     &[]
                 };
@@ -833,8 +842,8 @@ where
                     mask: None,
                     cache: self.cache,
                 }));
-                let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-                    repeat_window(&self.history)
+                let recent: &[u32] = if self.sampler.keeps_history() {
+                    &self.history
                 } else {
                     &[]
                 };

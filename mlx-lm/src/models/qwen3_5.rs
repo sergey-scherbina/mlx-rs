@@ -1276,10 +1276,19 @@ impl<'a> Generate<'a> {
 
     /// Set top-p / top-k / repeat-penalty (temp came from `new`). `top_k<=0`,
     /// `top_p>=1`, `repeat_penalty==1` disable the respective filter.
-    pub fn set_sampler(&mut self, top_p: f32, top_k: i32, repeat_penalty: f32) {
+    pub fn set_sampler(
+        &mut self,
+        top_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) {
         self.sampler.top_p = top_p;
         self.sampler.top_k = top_k;
         self.sampler.repeat_penalty = repeat_penalty;
+        self.sampler.frequency_penalty = frequency_penalty;
+        self.sampler.presence_penalty = presence_penalty;
     }
 }
 
@@ -1385,8 +1394,8 @@ impl Iterator for Generate<'_> {
         } else {
             tri!(self.model.forward(&inputs, &mut self.cache))
         };
-        let recent: &[u32] = if self.sampler.repeat_penalty != 1.0 {
-            crate::models::qwen3::repeat_window(&self.history)
+        let recent: &[u32] = if self.sampler.keeps_history() {
+            &self.history
         } else {
             &[]
         };
@@ -1397,7 +1406,7 @@ impl Iterator for Generate<'_> {
         ));
         // Maintain history only when the penalty is active (needs the token id ->
         // an eval; the host re-uses the now-materialized token, so no double sync).
-        if self.sampler.repeat_penalty != 1.0 {
+        if self.sampler.keeps_history() {
             tri!(mlx_rs::transforms::eval([&y]));
             self.history.push(y.index(0).item::<u32>());
         }
