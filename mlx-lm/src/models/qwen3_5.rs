@@ -199,7 +199,10 @@ pub struct ModelArgs {
     pub linear_key_head_dim: i32,
     pub linear_value_head_dim: i32,
     pub linear_conv_kernel_dim: i32,
-    pub tie_word_embeddings: bool,
+    /// Optional because a multimodal wrapper may state it only at the top level (Qwen3.5-9B does).
+    /// `tie_word_embeddings()` resolves it; nothing should read this field directly.
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
     #[serde(default)]
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     pub quantization: Option<QuantizationConfig>,
@@ -214,6 +217,17 @@ pub struct RopeParameters {
 }
 
 impl ModelArgs {
+    /// Whether the input embedding is reused as the output projection.
+    ///
+    /// Absent means FALSE, and that is the transformers default rather than a guess: a checkpoint
+    /// that ties says so. It matters because the answer decides whether an `lm_head` is built, and
+    /// the two Qwen3.5 checkpoints disagree — the 9B is untied and ships `language_model.lm_head.*`,
+    /// the 4B is tied and ships none. The wrapper's value is folded in at load, so by the time this
+    /// is called the field holds whichever level stated it.
+    pub fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings.unwrap_or(false)
+    }
+
     fn is_linear(&self, layer_idx: i32) -> bool {
         (layer_idx + 1) % self.full_attention_interval != 0
     }
@@ -901,7 +915,7 @@ pub struct Model {
 impl Model {
     pub fn new(args: ModelArgs) -> Result<Self, Exception> {
         let model = Qwen3_5Model::new(&args)?;
-        let lm_head = if !args.tie_word_embeddings {
+        let lm_head = if !args.tie_word_embeddings() {
             Some(MaybeQuantized::Original(
                 nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
                     .bias(false)
@@ -1028,6 +1042,14 @@ pub struct WeightMap {
 struct WrappedConfig {
     text_config: ModelArgs,
     quantization: Option<QuantizationConfig>,
+    /// The WRAPPER's value, kept because a nested `text_config` may omit it.
+    ///
+    /// `Qwen3.5-9B` states `tie_word_embeddings: false` at the top level and does not repeat it
+    /// inside `text_config`; `Qwen3.5-4B` states `true` in both. The field decides whether an
+    /// `lm_head` is built, and the two checkpoints differ accordingly — the 9B ships
+    /// `language_model.lm_head.*`, the 4B ships none — so it cannot simply be defaulted and
+    /// forgotten. When the text config omits it, the wrapper's value is the model's value.
+    tie_word_embeddings: Option<bool>,
 }
 
 const NORM_PLUS_ONE_SUFFIXES: &[&str] = &[
@@ -1042,18 +1064,32 @@ pub fn load_qwen3_5_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let text = std::fs::read_to_string(model_dir.join("config.json"))?;
     // Either a multimodal wrapper (text_config) or a bare text config.
-    let (mut args, quantization): (ModelArgs, Option<QuantizationConfig>) =
-        match serde_json::from_str::<WrappedConfig>(&text) {
-            Ok(w) => {
-                let q = w.text_config.quantization.clone().or(w.quantization);
-                (w.text_config, q)
-            }
-            Err(_) => {
-                let a: ModelArgs = serde_json::from_str(&text)?;
-                let q = a.quantization.clone();
-                (a, q)
-            }
-        };
+    // A wrapper that EXISTS and fails to parse must report its own error, not fall through.
+    //
+    // The fallback below is for a BARE text config — a file with no `text_config` at all. Using it
+    // for a wrapper that merely failed to deserialise turns a precise error into a wrong one: with
+    // `tie_word_embeddings` still required inside `text_config`, `Qwen3.5-9B` (which states it only
+    // at the top level) failed the wrapper parse, fell through, and was then reported as
+    // `missing field hidden_size` — a field it has, in a place nothing was looking. The one-line
+    // question "which field is actually missing" cost a diagnosis because the answer was discarded.
+    let has_wrapper = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("text_config").cloned())
+        .is_some();
+    let (mut args, quantization): (ModelArgs, Option<QuantizationConfig>) = if has_wrapper {
+        let w: WrappedConfig = serde_json::from_str(&text)?;
+        let q = w.text_config.quantization.clone().or(w.quantization);
+        let mut a = w.text_config;
+        // The wrapper's value applies when the text config does not state one.
+        if a.tie_word_embeddings.is_none() {
+            a.tie_word_embeddings = w.tie_word_embeddings;
+        }
+        (a, q)
+    } else {
+        let a: ModelArgs = serde_json::from_str(&text)?;
+        let q = a.quantization.clone();
+        (a, q)
+    };
     args.quantization = quantization.clone();
     let mut model = Model::new(args)?;
 

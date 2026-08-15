@@ -113,7 +113,9 @@ impl ModelArgs {
             linear_key_head_dim: self.linear_key_head_dim,
             linear_value_head_dim: self.linear_value_head_dim,
             linear_conv_kernel_dim: self.linear_conv_kernel_dim,
-            tie_word_embeddings: self.tie_word_embeddings,
+            // Now Option on the dense side: a multimodal wrapper may state it only at the top
+            // level, so the field distinguishes "absent" from "false". The MoE config states it.
+            tie_word_embeddings: Some(self.tie_word_embeddings),
             rope_scaling: self.rope_scaling.clone(),
             quantization: self.quantization.clone(),
         }
